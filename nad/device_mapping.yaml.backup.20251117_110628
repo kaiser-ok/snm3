@@ -1,0 +1,46 @@
+device_types:
+  external:
+    characteristics:
+    - 默认分类
+    - 需要人工审查
+    description: 外部IP或未分类的内部IP
+    ip_ranges: []
+  iot:
+    characteristics:
+    - 周期性通信
+    - 小流量
+    - 特定协议
+    description: IoT设备、传感器、摄像头等
+    ip_ranges:
+    - 192.168.0.0/24
+  server_farm:
+    characteristics:
+    - 高入站流量
+    - 多并发连线
+    - 提供服务端口
+    description: 服务器群，提供各种服务
+    ip_ranges:
+    - 192.168.10.0/24
+    - 192.168.20.0/24
+    - 192.168.30.0/24
+  station:
+    characteristics:
+    - 主动发起连线
+    - 低到中等流量
+    - 访问外部服务
+    description: 工作站、PC、笔电、iPad等终端设备
+    ip_ranges:
+    - 192.168.50.0/24
+    - 192.168.60.0/24
+    - 192.168.70.0/24
+    - 192.168.100.0/24
+special_devices:
+  critical_servers:
+    device_type: server_farm
+    ips:
+    - 192.168.10.135
+  dns_servers:
+    device_type: external
+    ips:
+    - 168.95.1.1
+    - 8.8.8.8

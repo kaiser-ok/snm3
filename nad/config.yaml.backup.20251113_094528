@@ -1,0 +1,90 @@
+# NAD (NetFlow Anomaly Detector) Configuration
+
+# Elasticsearch 配置
+elasticsearch:
+  host: "http://localhost:9200"
+  indices:
+    raw: "radar_flow_collector-*"
+    aggregated: "netflow_stats_5m"
+  timeout: 30
+
+# MySQL 配置
+mysql:
+  host: "localhost"
+  port: 3306
+  database: "Control_DB"
+  user: "control_user"
+  password: "gentrice"
+
+# Isolation Forest 配置
+isolation_forest:
+  contamination: 0.05          # 預期異常比例 5%
+  n_estimators: 150            # 樹的數量
+  max_samples: 512             # 每棵樹的樣本數
+  max_features: 0.8            # 使用 80% 的特徵
+  random_state: 42
+  n_jobs: -1                   # 使用所有 CPU 核心
+
+# 訓練配置
+training:
+  baseline_days: 7             # 訓練數據天數
+  retrain_interval_days: 7     # 重訓練間隔
+  min_samples: 1000            # 最少樣本數
+  test_size: 0.2               # 測試集比例
+
+# 特徵配置
+features:
+  basic:
+    - flow_count
+    - total_bytes
+    - total_packets
+    - unique_dsts
+    - unique_src_ports           # 不同源通訊埠數量（新增）
+    - unique_dst_ports           # 不同目的通訊埠數量（新增）
+    - avg_bytes
+    - max_bytes
+
+  derived:
+    - dst_diversity              # unique_dsts / flow_count
+    - src_port_diversity         # unique_src_ports / flow_count（新增）
+    - dst_port_diversity         # unique_dst_ports / flow_count（新增）
+    - traffic_concentration      # max_bytes / total_bytes
+    - bytes_per_packet           # total_bytes / total_packets
+
+  binary:
+    - is_high_connection         # flow_count > 1000
+    - is_scanning_pattern        # unique_dsts > 30 && avg_bytes < 10000
+    - is_small_packet            # avg_bytes < 1000
+    - is_large_flow              # max_bytes > 100MB
+    - is_likely_server_response  # src_port_diversity < 0.1 && dst_port_diversity > 0.3 && unique_src_ports <= 10 && flow_count > 100
+
+  log_transform:
+    - log_flow_count
+    - log_total_bytes
+
+# 實時檢測配置
+realtime:
+  check_interval_minutes: 5    # 檢測間隔
+  recent_window_minutes: 10    # 分析最近 N 分鐘
+  anomaly_threshold: 0.6       # 異常置信度閾值
+
+# 異常分類閾值
+thresholds:
+  high_connection: 1000        # 高連線數閾值
+  scanning_dsts: 30            # 掃描目的地數
+  scanning_avg_bytes: 10000    # 掃描平均流量
+  small_packet: 1000           # 小封包閾值
+  large_flow: 104857600        # 大流量閾值 (100MB)
+
+# 輸出配置
+output:
+  reports_dir: "reports"
+  models_dir: "nad/models"
+  logs_dir: "logs"
+  save_predictions: true
+
+# 日誌配置
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/nad.log"

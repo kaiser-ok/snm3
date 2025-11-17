@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mysql:*)",
+      "WebSearch",
+      "Bash(python3:*)",
+      "Bash(./monitor.sh:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

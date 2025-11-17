@@ -1,0 +1,70 @@
+elasticsearch:
+  host: http://localhost:9200
+  indices:
+    raw: radar_flow_collector-*
+    aggregated: netflow_stats_5m
+  timeout: 30
+mysql:
+  host: localhost
+  port: 3306
+  database: Control_DB
+  user: control_user
+  password: gentrice
+isolation_forest:
+  contamination: 0.05
+  n_estimators: 150
+  max_samples: 512
+  max_features: 0.8
+  random_state: 42
+  n_jobs: -1
+training:
+  baseline_days: 7
+  retrain_interval_days: 7
+  min_samples: 1000
+  test_size: 0.2
+features:
+  basic:
+  - flow_count
+  - total_bytes
+  - total_packets
+  - unique_dsts
+  - unique_src_ports
+  - unique_dst_ports
+  - avg_bytes
+  - max_bytes
+  derived:
+  - dst_diversity
+  - src_port_diversity
+  - dst_port_diversity
+  - traffic_concentration
+  - bytes_per_packet
+  binary:
+  - is_high_connection
+  - is_scanning_pattern
+  - is_small_packet
+  - is_large_flow
+  - is_likely_server_response
+  log_transform:
+  - log_flow_count
+  - log_total_bytes
+  device_type:
+  - device_type
+realtime:
+  check_interval_minutes: 5
+  recent_window_minutes: 10
+  anomaly_threshold: 0.6
+thresholds:
+  high_connection: 352
+  scanning_dsts: 3
+  scanning_avg_bytes: 2200
+  small_packet: 456
+  large_flow: 7914975
+output:
+  reports_dir: reports
+  models_dir: nad/models
+  logs_dir: logs
+  save_predictions: true
+logging:
+  level: INFO
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  file: logs/nad.log

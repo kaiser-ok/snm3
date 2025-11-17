@@ -1,0 +1,98 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+*.pid
+
+# Machine Learning Models
+nad/models/*.pkl
+nad/models/*.joblib
+nad/models/*.h5
+nad/models/*.pt
+nad/models/*.pth
+
+# Reports (可選，如果報告包含敏感資訊)
+reports/*.html
+reports/*.pdf
+
+# Backup files
+*.backup
+*.bak
+*.tmp
+*~
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment variables (重要！包含密碼等敏感資訊)
+.env
+.env.local
+.env.*.local
+config.local.yaml
+secrets.yaml
+
+# Config files with sensitive data
+nad/config.yaml
+
+# Temporary files
+*.tmp
+temp/
+tmp/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Project specific
+backfill_*.log
+training_*.log
+realtime_detection.log
+*.pid
+
+# Keep model directory but ignore models
+!nad/models/.gitkeep
