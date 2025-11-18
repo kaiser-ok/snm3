@@ -1,24 +1,25 @@
 device_types:
   external:
     characteristics:
-    - 默认分类
-    - 需要人工审查
-    description: 外部IP或未分类的内部IP
+    - 預設分類
+    - 需要人工審查
+    description: 外部IP或未分類的內部IP
     ip_ranges: []
   iot:
     characteristics:
-    - 周期性通信
     - 小流量
-    - 特定协议
-    description: IoT设备、传感器、摄像头等
+    - 特定協議
+    description: switch管理網段
+    display_name: switch網管
+    icon: 🛠️
     ip_ranges:
     - 192.168.0.0/24
   server_farm:
     characteristics:
     - 高入站流量
-    - 多并发连线
-    - 提供服务端口
-    description: 服务器群，提供各种服务
+    - 多並發連線
+    - 提供服務端口
+    description: 服務器群，提供各種服務
     ip_ranges:
     - 192.168.10.0/24
     - 192.168.20.0/24
@@ -30,11 +31,24 @@ device_types:
     - 訪問外部服務
     - 新增特徵測試
     description: 工作站、PC、筆電、iPad等終端設備（已更新）
+    display_name: 工作站
+    icon: 🖥️
     ip_ranges:
     - 192.168.50.0/24
     - 192.168.60.0/24
     - 192.168.70.0/24
     - 192.168.100.0/24
+  vpn:
+    characteristics:
+    - 主動發起連線
+    - 受管控設備
+    - 低流量
+    - 中等流量
+    description: 透過VPN 連回公司
+    display_name: VPN client
+    icon: 🌟
+    ip_ranges:
+    - 10.10.10.0/24
 special_devices:
   critical_servers:
     device_type: server_farm

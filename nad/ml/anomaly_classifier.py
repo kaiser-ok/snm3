@@ -178,6 +178,98 @@ THREAT_CLASSES = {
             '可能需要更新分類規則'
         ],
         'auto_action': 'MONITOR'
+    },
+
+    # ===== Dst 視角威脅類別 =====
+    'DDOS_TARGET': {
+        'name': 'DDoS 攻擊目標',
+        'name_en': 'DDoS Target',
+        'severity': 'CRITICAL',
+        'priority': 'P0',
+        'description': '主機正遭受 DDoS 攻擊',
+        'indicators': [
+            '大量不同來源 IP（> 100）',
+            '極高連線數（> 1000）',
+            '小封包模式（< 500 bytes）'
+        ],
+        'response': [
+            '啟動 DDoS 防護機制',
+            '限速或黑洞路由',
+            '分析攻擊模式',
+            '聯繫 ISP 協助'
+        ],
+        'auto_action': 'RATE_LIMIT'
+    },
+    'SCAN_TARGET': {
+        'name': '掃描目標',
+        'name_en': 'Scan Target',
+        'severity': 'HIGH',
+        'priority': 'P0',
+        'description': '主機正被掃描端口',
+        'indicators': [
+            '大量不同來源端口（> 100）',
+            '掃描多個目標端口',
+            '小封包探測'
+        ],
+        'response': [
+            '加強防火牆規則',
+            '監控掃描來源',
+            '檢查主機漏洞',
+            '記錄掃描行為'
+        ],
+        'auto_action': 'MONITOR'
+    },
+    'DATA_SINK': {
+        'name': '資料外洩目標端',
+        'name_en': 'Data Sink',
+        'severity': 'CRITICAL',
+        'priority': 'P0',
+        'description': '外部 IP 收到大量內部數據',
+        'indicators': [
+            '多個內部 IP 連接同一外部 IP',
+            '大流量傳輸',
+            '外部 IP 地址'
+        ],
+        'response': [
+            '立即封鎖外部 IP',
+            '調查內部感染主機',
+            '檢查數據洩漏範圍',
+            '報告安全事件'
+        ],
+        'auto_action': 'BLOCK'
+    },
+    'MALWARE_DISTRIBUTION': {
+        'name': '惡意軟體分發服務器',
+        'name_en': 'Malware Distribution Server',
+        'severity': 'CRITICAL',
+        'priority': 'P0',
+        'description': '外部服務器向多個內部 IP 分發數據（疑似惡意軟體）',
+        'indicators': [
+            '多個內部 IP 下載相同外部資源',
+            '大流量入站',
+            '外部 IP 地址'
+        ],
+        'response': [
+            '立即封鎖外部 IP',
+            '隔離已下載的內部主機',
+            '掃描惡意軟體',
+            '調查感染源'
+        ],
+        'auto_action': 'BLOCK'
+    },
+    'POPULAR_SERVER': {
+        'name': '熱門服務器',
+        'name_en': 'Popular Server',
+        'severity': 'LOW',
+        'priority': 'P3',
+        'description': '合法的熱門服務（如內網 DNS, Web 服務）',
+        'indicators': [
+            '大量內部 IP 訪問',
+            '正常封包大小',
+            '內部 IP 地址'
+        ],
+        'response': ['監控流量模式', '確保服務正常運行'],
+        'auto_action': 'MONITOR'
     }
 }
 
@@ -717,3 +809,139 @@ class AnomalyClassifier:
             'LOW': '🟢'
         }
         return emoji_map.get(severity, '⚪')
+
+    # ========== Dst 視角分類 ==========
+
+    def classify_dst(self, features: Dict, context: Dict = None) -> Dict:
+        """
+        Dst 視角的異常分類
+
+        Args:
+            features: 特徵字典（from dst perspective）
+                - unique_srcs: 來源 IP 數量
+                - unique_src_ports: 來源端口數量
+                - unique_dst_ports: 目標端口數量
+                - flow_count: 連線數
+                - total_bytes: 總流量
+                - avg_bytes: 平均封包大小
+                - flows_per_src: 每個來源的平均連線數
+                - bytes_per_src: 每個來源的平均流量
+            context: 上下文信息
+                - dst_ip: 目標 IP
+                - timestamp: 時間戳
+
+        Returns:
+            分類結果字典
+        """
+        if context is None:
+            context = {}
+
+        dst_ip = context.get('dst_ip', 'unknown')
+
+        # 1. DDoS 攻擊目標
+        if self._is_ddos_target(features, context):
+            return self._create_classification('DDOS_TARGET', 0.95, features, context)
+
+        # 2. 掃描目標
+        if self._is_scan_target(features, context):
+            return self._create_classification('SCAN_TARGET', 0.90, features, context)
+
+        # 3. 資料外洩目標端
+        if self._is_data_sink(features, context):
+            return self._create_classification('DATA_SINK', 0.85, features, context)
+
+        # 4. 惡意軟體分發服務器
+        if self._is_malware_distribution(features, context):
+            return self._create_classification('MALWARE_DISTRIBUTION', 0.80, features, context)
+
+        # 5. 熱門服務器（內部服務）
+        if self._is_popular_server(features, context):
+            return self._create_classification('POPULAR_SERVER', 0.70, features, context)
+
+        # 6. 未知 dst 異常
+        return self._create_classification('UNKNOWN', 0.50, features, context)
+
+    def _is_ddos_target(self, features: Dict, context: Dict) -> bool:
+        """判斷是否為 DDoS 攻擊目標"""
+        unique_srcs = features.get('unique_srcs', 0)
+        flow_count = features.get('flow_count', 0)
+        avg_bytes = features.get('avg_bytes', 0)
+
+        # DDoS 特徵：
+        # 1. 大量不同來源（> 100）
+        # 2. 極高連線數（> 1000）
+        # 3. 小封包（< 500 bytes）- SYN flood 特徵
+        return (
+            unique_srcs > 100 and
+            flow_count > 1000 and
+            avg_bytes < 500
+        )
+
+    def _is_scan_target(self, features: Dict, context: Dict) -> bool:
+        """判斷是否為掃描目標"""
+        unique_src_ports = features.get('unique_src_ports', 0)
+        unique_dst_ports = features.get('unique_dst_ports', 0)
+        avg_bytes = features.get('avg_bytes', 0)
+
+        # 掃描目標特徵：
+        # 1. 大量不同來源端口（> 100）- 掃描器隨機化來源端口
+        # 2. 多個目標端口被探測（> 50）
+        # 3. 小封包（探測性質）
+        return (
+            unique_src_ports > 100 and
+            unique_dst_ports > 50 and
+            avg_bytes < 2000
+        )
+
+    def _is_data_sink(self, features: Dict, context: Dict) -> bool:
+        """判斷是否為資料外洩目標端"""
+        unique_srcs = features.get('unique_srcs', 0)
+        total_bytes = features.get('total_bytes', 0)
+        avg_bytes = features.get('avg_bytes', 0)
+        dst_ip = context.get('dst_ip', '')
+
+        # 資料外洩目標端特徵：
+        # 1. 多個內部來源（> 10）
+        # 2. 大流量（> 100MB）
+        # 3. 目標是外部 IP
+        return (
+            unique_srcs > 10 and
+            total_bytes > 100e6 and  # > 100MB
+            avg_bytes > 10000 and  # 大封包（傳輸數據）
+            not self._is_internal_ip(dst_ip)
+        )
+
+    def _is_malware_distribution(self, features: Dict, context: Dict) -> bool:
+        """判斷是否為惡意軟體分發服務器"""
+        unique_srcs = features.get('unique_srcs', 0)
+        total_bytes = features.get('total_bytes', 0)
+        flows_per_src = features.get('flows_per_src', 0)
+        dst_ip = context.get('dst_ip', '')
+
+        # 惡意軟體分發特徵：
+        # 1. 多個內部來源下載（> 5）
+        # 2. 大流量入站（> 50MB）
+        # 3. 每個來源連線次數少（< 10）- 下載後就斷開
+        # 4. 目標是外部 IP
+        return (
+            unique_srcs > 5 and
+            total_bytes > 50e6 and
+            flows_per_src < 10 and
+            not self._is_internal_ip(dst_ip)
+        )
+
+    def _is_popular_server(self, features: Dict, context: Dict) -> bool:
+        """判斷是否為熱門服務器（正常）"""
+        unique_srcs = features.get('unique_srcs', 0)
+        avg_bytes = features.get('avg_bytes', 0)
+        dst_ip = context.get('dst_ip', '')
+
+        # 熱門服務器特徵：
+        # 1. 大量內部來源訪問（> 20）
+        # 2. 正常封包大小（500-50000 bytes）
+        # 3. 目標是內部 IP
+        return (
+            unique_srcs > 20 and
+            500 < avg_bytes < 50000 and
+            self._is_internal_ip(dst_ip)
+        )

@@ -2,7 +2,11 @@
 """
 歷史資料回填工具
 
-將過去 N 天的原始 NetFlow 資料聚合並寫入 netflow_stats_5m 索引
+將過去 N 天的原始 NetFlow 資料聚合並寫入索引
+支援兩種聚合模式：
+1. by_src: 以來源 IP 聚合 -> netflow_stats_5m
+2. by_dst: 以目標 IP 聚合 -> netflow_stats_5m_by_dst
+
 模擬 Transform 的聚合邏輯，但處理歷史資料
 """
 
@@ -15,12 +19,40 @@ import sys
 # ES 配置
 ES_HOST = "http://localhost:9200"
 SOURCE_INDEX = "radar_flow_collector-*"
-DEST_INDEX = "netflow_stats_5m"
+
+# 聚合模式配置
+AGGREGATION_MODES = {
+    'by_src': {
+        'dest_index': 'netflow_stats_5m',
+        'group_field': 'IPV4_SRC_ADDR',
+        'cardinality_field': 'IPV4_DST_ADDR',
+        'cardinality_name': 'unique_dsts',
+        'description': '以來源 IP 聚合'
+    },
+    'by_dst': {
+        'dest_index': 'netflow_stats_5m_by_dst',
+        'group_field': 'IPV4_DST_ADDR',
+        'cardinality_field': 'IPV4_SRC_ADDR',
+        'cardinality_name': 'unique_srcs',
+        'description': '以目標 IP 聚合'
+    }
+}
 
 class HistoricalDataBackfill:
     """歷史資料回填處理器"""
 
-    def __init__(self):
+    def __init__(self, mode='by_src'):
+        """
+        初始化回填處理器
+
+        Args:
+            mode: 聚合模式 ('by_src' 或 'by_dst')
+        """
+        if mode not in AGGREGATION_MODES:
+            raise ValueError(f"不支援的聚合模式: {mode}。支援的模式: {list(AGGREGATION_MODES.keys())}")
+
+        self.mode = mode
+        self.mode_config = AGGREGATION_MODES[mode]
         self.es_url = ES_HOST
         self.processed_buckets = 0
         self.processed_docs = 0
@@ -37,8 +69,11 @@ class HistoricalDataBackfill:
             auto_confirm: 自動確認執行（用於背景執行）
         """
         print("=" * 80)
-        print(f"NetFlow 歷史資料回填工具")
+        print(f"NetFlow 歷史資料回填工具 - {self.mode_config['description']}")
         print("=" * 80)
+        print(f"聚合模式: {self.mode}")
+        print(f"目標索引: {self.mode_config['dest_index']}")
+        print(f"群組欄位: {self.mode_config['group_field']}")
         print(f"回填範圍: 過去 {days} 天")
         print(f"批次大小: {batch_hours} 小時/批")
         print(f"模式: {'測試模式 (不寫入)' if dry_run else '正式模式 (寫入數據)'}")
@@ -106,7 +141,11 @@ class HistoricalDataBackfill:
         print(f"🔍 查詢原始資料...")
         print(f"   預計包含 {num_5m_buckets} 個5分鐘時間桶")
 
-        # 構建聚合查詢 (完全模擬 Transform 配置)
+        # 構建聚合查詢（動態根據模式調整）
+        group_field = self.mode_config['group_field']
+        cardinality_field = self.mode_config['cardinality_field']
+        cardinality_name = self.mode_config['cardinality_name']
+
         query = {
             "size": 0,
             "query": {
@@ -126,9 +165,9 @@ class HistoricalDataBackfill:
                         "min_doc_count": 1
                     },
                     "aggs": {
-                        "by_src_ip": {
+                        "by_ip": {
                             "terms": {
-                                "field": "IPV4_SRC_ADDR",
+                                "field": group_field,
                                 "size": 10000  # 處理大量 IP
                             },
                             "aggs": {
@@ -139,11 +178,11 @@ class HistoricalDataBackfill:
                                     "sum": {"field": "IN_PKTS"}
                                 },
                                 "flow_count": {
-                                    "value_count": {"field": "IPV4_SRC_ADDR"}
+                                    "value_count": {"field": group_field}
                                 },
-                                "unique_dsts": {
+                                cardinality_name: {
                                     "cardinality": {
-                                        "field": "IPV4_DST_ADDR",
+                                        "field": cardinality_field,
                                         "precision_threshold": 3000
                                     }
                                 },
@@ -195,27 +234,35 @@ class HistoricalDataBackfill:
         docs_to_index = []
         total_ips = 0
 
+        # 根據模式決定 IP 欄位名稱
+        ip_field_name = 'src_ip' if self.mode == 'by_src' else 'dst_ip'
+
         for time_bucket in time_buckets:
             bucket_time = time_bucket['key_as_string']
-            ip_buckets = time_bucket['by_src_ip']['buckets']
+            ip_buckets = time_bucket['by_ip']['buckets']
             total_ips += len(ip_buckets)
 
             for ip_bucket in ip_buckets:
+                # 建立文檔（包含所有通用欄位）
                 doc = {
                     "time_bucket": bucket_time,
-                    "src_ip": ip_bucket['key'],
+                    ip_field_name: ip_bucket['key'],
                     "total_bytes": ip_bucket['total_bytes']['value'],
                     "total_packets": ip_bucket['total_packets']['value'],
                     "flow_count": ip_bucket['flow_count']['value'],
-                    "unique_dsts": ip_bucket['unique_dsts']['value'],
                     "unique_src_ports": ip_bucket['unique_src_ports']['value'],
                     "unique_dst_ports": ip_bucket['unique_dst_ports']['value'],
                     "avg_bytes": ip_bucket['avg_bytes']['value'],
                     "max_bytes": ip_bucket['max_bytes']['value']
                 }
+
+                # 添加模式特定的 cardinality 欄位
+                cardinality_name = self.mode_config['cardinality_name']
+                doc[cardinality_name] = ip_bucket[cardinality_name]['value']
+
                 docs_to_index.append(doc)
 
-        print(f"   📊 聚合結果: {total_ips} 個唯一 IP")
+        print(f"   📊 聚合結果: {total_ips} 個唯一 IP ({ip_field_name})")
 
         if dry_run:
             print(f"   🔍 [測試模式] 跳過寫入，共 {len(docs_to_index)} 筆文檔")
@@ -235,18 +282,21 @@ class HistoricalDataBackfill:
         if not docs:
             return
 
-        print(f"   💾 寫入 {len(docs)} 筆文檔到 {DEST_INDEX}...")
+        dest_index = self.mode_config['dest_index']
+        print(f"   💾 寫入 {len(docs)} 筆文檔到 {dest_index}...")
 
         # 構建 bulk 請求
         bulk_body = []
+        ip_field_name = 'src_ip' if self.mode == 'by_src' else 'dst_ip'
+
         for doc in docs:
-            # 使用 time_bucket + src_ip 作為文檔 ID，避免重複
-            doc_id = f"{doc['time_bucket']}_{doc['src_ip']}"
+            # 使用 time_bucket + IP 作為文檔 ID，避免重複
+            doc_id = f"{doc['time_bucket']}_{doc[ip_field_name]}"
 
             # Index action
             bulk_body.append(json.dumps({
                 "index": {
-                    "_index": DEST_INDEX,
+                    "_index": dest_index,
                     "_id": doc_id
                 }
             }))
@@ -306,7 +356,7 @@ class HistoricalDataBackfill:
     def check_existing_data(self, days=3):
         """檢查目標索引中已有的歷史資料範圍"""
         print("\n" + "=" * 80)
-        print("檢查現有資料")
+        print(f"檢查現有資料 - {self.mode_config['dest_index']}")
         print("=" * 80)
 
         query = {
@@ -333,8 +383,9 @@ class HistoricalDataBackfill:
         }
 
         try:
+            dest_index = self.mode_config['dest_index']
             response = requests.post(
-                f"{self.es_url}/{DEST_INDEX}/_search",
+                f"{self.es_url}/{dest_index}/_search",
                 json=query,
                 headers={'Content-Type': 'application/json'}
             )
@@ -360,7 +411,18 @@ class HistoricalDataBackfill:
 
 
 def main():
-    backfill = HistoricalDataBackfill()
+    # 解析聚合模式
+    mode = 'by_src'  # 預設模式
+    if '--mode' in sys.argv:
+        mode_idx = sys.argv.index('--mode')
+        if len(sys.argv) > mode_idx + 1:
+            mode = sys.argv[mode_idx + 1]
+            if mode not in AGGREGATION_MODES:
+                print(f"❌ 錯誤: 不支援的聚合模式 '{mode}'")
+                print(f"   支援的模式: {', '.join(AGGREGATION_MODES.keys())}")
+                sys.exit(1)
+
+    backfill = HistoricalDataBackfill(mode=mode)
 
     # 解析命令行參數
     if '--check' in sys.argv:
@@ -399,13 +461,16 @@ NetFlow 歷史資料回填工具
     # 測試模式 (不實際寫入，僅顯示會處理的資料)
     python3 backfill_historical_data.py
     python3 backfill_historical_data.py --days 3
+    python3 backfill_historical_data.py --mode by_dst --days 3
 
     # 正式執行 (實際寫入資料)
     python3 backfill_historical_data.py --execute
     python3 backfill_historical_data.py --execute --days 3
+    python3 backfill_historical_data.py --execute --mode by_dst --days 3
 
     # 背景執行（自動確認，不需要輸入 yes/no）
     python3 backfill_historical_data.py --execute --auto-confirm --days 3
+    python3 backfill_historical_data.py --execute --auto-confirm --mode by_dst --days 3
 
     # 自訂批次大小 (每批處理幾小時)
     python3 backfill_historical_data.py --execute --days 7 --batch-hours 2
@@ -413,8 +478,12 @@ NetFlow 歷史資料回填工具
     # 檢查現有資料
     python3 backfill_historical_data.py --check
     python3 backfill_historical_data.py --check 7
+    python3 backfill_historical_data.py --mode by_dst --check 7
 
 參數說明:
+    --mode MODE      聚合模式 (by_src 或 by_dst，預設: by_src)
+                     - by_src: 以來源 IP 聚合 -> netflow_stats_5m
+                     - by_dst: 以目標 IP 聚合 -> netflow_stats_5m_by_dst
     --execute        正式執行模式 (會實際寫入資料)
     --auto-confirm   自動確認執行（用於 nohup 背景執行）
     --days N         回填過去 N 天的資料 (預設: 3)
@@ -422,21 +491,38 @@ NetFlow 歷史資料回填工具
     --check [N]      檢查索引中現有資料 (可選擇天數)
     --help, -h       顯示此說明
 
+聚合模式詳解:
+    by_src (預設):
+        - 以 IPV4_SRC_ADDR 分組
+        - 統計每個來源 IP 的行為
+        - 輸出到 netflow_stats_5m 索引
+        - 用於偵測掃描、攻擊來源等
+
+    by_dst:
+        - 以 IPV4_DST_ADDR 分組
+        - 統計每個目標 IP 的行為
+        - 輸出到 netflow_stats_5m_by_dst 索引
+        - 用於偵測 DDoS 目標、被掃描目標等
+
 注意事項:
     1. 首次執行建議使用測試模式，確認資料範圍無誤
     2. 批次大小建議 1-6 小時，避免單次查詢過大
-    3. 回填會自動跳過已存在的文檔 (使用 time_bucket + src_ip 作為 ID)
+    3. 回填會自動跳過已存在的文檔 (使用 time_bucket + IP 作為 ID)
     4. 大量回填可能需要較長時間，請耐心等待
+    5. 兩種模式可獨立執行，互不影響
 
 範例:
-    # 回填過去3天，測試模式
+    # 回填過去3天，by_src 模式，測試模式
     python3 backfill_historical_data.py --days 3
 
-    # 確認無誤後，正式執行
+    # 確認無誤後，正式執行 by_src 模式
     python3 backfill_historical_data.py --execute --days 3
 
-    # 回填過去7天，每批處理2小時
-    python3 backfill_historical_data.py --execute --days 7 --batch-hours 2
+    # 回填過去7天，by_dst 模式，正式執行
+    python3 backfill_historical_data.py --execute --mode by_dst --days 7 --batch-hours 2
+
+    # 檢查 by_dst 索引的現有資料
+    python3 backfill_historical_data.py --mode by_dst --check 7
         """)
         sys.exit(0)
 

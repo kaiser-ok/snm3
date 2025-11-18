@@ -10,10 +10,21 @@ import sys
 import json
 import math
 import argparse
+import warnings
 from datetime import datetime, timedelta
 from collections import Counter, defaultdict
 from elasticsearch import Elasticsearch
 from nad.utils.config_loader import load_config
+
+# 關閉 Elasticsearch 安全警告
+warnings.filterwarnings('ignore', message='.*Elasticsearch built-in security features are not enabled.*')
+
+# MySQL 支援（可選）
+try:
+    import pymysql
+    MYSQL_AVAILABLE = True
+except ImportError:
+    MYSQL_AVAILABLE = False
 
 
 class AnomalyVerifier:
@@ -23,6 +34,108 @@ class AnomalyVerifier:
         self.es = es_client
         self.config = config
         self.netflow_index = config.get('elasticsearch', {}).get('indices', {}).get('raw', 'radar_flow_collector-*')
+
+        # 初始化 MySQL 連線（可選）
+        self.mysql_conn = None
+        self.mysql_connected = False  # MySQL 連線狀態
+        self.ip_name_cache = {}  # IP 名稱快取
+        self._init_mysql_connection()
+
+    def _init_mysql_connection(self):
+        """初始化 MySQL 連線（如果可用且配置正確）"""
+        if not MYSQL_AVAILABLE:
+            self.mysql_connected = False
+            return
+
+        mysql_config = self.config.get('mysql', {})
+        if not mysql_config:
+            self.mysql_connected = False
+            return
+
+        try:
+            self.mysql_conn = pymysql.connect(
+                host=mysql_config.get('host', 'localhost'),
+                port=mysql_config.get('port', 3306),
+                user=mysql_config.get('user'),
+                password=mysql_config.get('password'),
+                database=mysql_config.get('database'),
+                connect_timeout=3
+            )
+            # 測試連線
+            with self.mysql_conn.cursor() as cursor:
+                cursor.execute("SELECT 1")
+            self.mysql_connected = True
+        except Exception as e:
+            # 連線失敗時靜默處理，不影響主要功能
+            self.mysql_conn = None
+            self.mysql_connected = False
+
+    def _get_ip_name(self, ip):
+        """
+        從 MySQL 查詢 IP 對應的設備名稱
+
+        Args:
+            ip: IP 地址
+
+        Returns:
+            設備名稱，如果找不到則返回 None
+        """
+        # 檢查快取
+        if ip in self.ip_name_cache:
+            return self.ip_name_cache[ip]
+
+        # 如果 MySQL 不可用，直接返回
+        if not self.mysql_conn:
+            self.ip_name_cache[ip] = None
+            return None
+
+        try:
+            with self.mysql_conn.cursor() as cursor:
+                # 先查詢 Device 表
+                cursor.execute(
+                    "SELECT Name FROM Device WHERE IP = %s LIMIT 1",
+                    (ip,)
+                )
+                result = cursor.fetchone()
+                if result and result[0]:
+                    name = result[0].strip()
+                    self.ip_name_cache[ip] = name
+                    return name
+
+                # 再查詢 ip_alias 表
+                cursor.execute(
+                    "SELECT alias FROM ip_alias WHERE ip = %s LIMIT 1",
+                    (ip,)
+                )
+                result = cursor.fetchone()
+                if result and result[0]:
+                    name = result[0].strip()
+                    self.ip_name_cache[ip] = name
+                    return name
+
+            # 沒找到
+            self.ip_name_cache[ip] = None
+            return None
+
+        except Exception:
+            # 查詢失敗時靜默處理
+            self.ip_name_cache[ip] = None
+            return None
+
+    def _format_ip_with_name(self, ip):
+        """
+        格式化 IP 顯示（如果有設備名稱則附加）
+
+        Args:
+            ip: IP 地址
+
+        Returns:
+            格式化的字串，例如 "192.168.1.1 (Web Server)"
+        """
+        name = self._get_ip_name(ip)
+        if name:
+            return f"{ip} ({name})"
+        return ip
 
     def verify_ip(self, src_ip, time_range_minutes=30):
         """
@@ -764,10 +877,41 @@ class AnomalyVerifier:
         if role == 'src':
             print(f"🎯 目的地分析:")
             print(f"   • 不同目的地數量: {dst['unique_destinations']}")
+            print(f"   • 分散度: {dst['dst_diversity_ratio']:.3f}")
+            # 顯示 TOP 5 目的地
+            if dst['top_destinations']:
+                num_to_display = min(5, len(dst['top_destinations']))
+                if num_to_display == len(dst['top_destinations']) and num_to_display < 5:
+                    print(f"\n   連線次數最多的前 {num_to_display} 個目的地:")
+                else:
+                    print(f"\n   TOP 5 連線目的地:")
+                for i, dst_info in enumerate(dst['top_destinations'][:5], 1):
+                    ip = dst_info['ip']
+                    if ip in ['0.0.0.0', '::']:
+                        ip_display = f"{ip} (數據缺失)"
+                    else:
+                        ip_display = self._format_ip_with_name(ip)
+                    print(f"      {i}. {ip_display:50s} → {dst_info['count']:5,} 次 ({dst_info['percentage']:.1f}%)")
+            print()
         else:
             print(f"🎯 來源分析:")
             print(f"   • 不同來源數量: {dst['unique_destinations']}")
-        print(f"   • 分散度: {dst['dst_diversity_ratio']:.3f}\n")
+            print(f"   • 分散度: {dst['dst_diversity_ratio']:.3f}")
+            # 顯示 TOP 5 來源
+            if dst['top_destinations']:
+                num_to_display = min(5, len(dst['top_destinations']))
+                if num_to_display == len(dst['top_destinations']) and num_to_display < 5:
+                    print(f"\n   連線次數最多的前 {num_to_display} 個來源:")
+                else:
+                    print(f"\n   TOP 5 連線來源:")
+                for i, src_info in enumerate(dst['top_destinations'][:5], 1):
+                    ip = src_info['ip']
+                    if ip in ['0.0.0.0', '::']:
+                        ip_display = f"{ip} (數據缺失)"
+                    else:
+                        ip_display = self._format_ip_with_name(ip)
+                    print(f"      {i}. {ip_display:50s} → {src_info['count']:5,} 次 ({src_info['percentage']:.1f}%)")
+            print()
 
         # 通訊埠分析
         port = analysis['port_analysis']
@@ -776,9 +920,16 @@ class AnomalyVerifier:
         else:
             print(f"🔌 來源通訊埠分析:")
         print(f"   • 不同通訊埠數量: {port['unique_ports']}")
+
+        # 顯示 TOP 5 通訊埠
         if port['top_ports']:
-            top_port = port['top_ports'][0]
-            print(f"   • 最常用: {top_port['port']} ({top_port['service']}) - {top_port['percentage']:.1f}%\n")
+            if role == 'src':
+                print(f"\n   TOP 5 目的通訊埠:")
+            else:
+                print(f"\n   TOP 5 來源通訊埠:")
+            for i, port_info in enumerate(port['top_ports'][:5], 1):
+                print(f"      {i}. {port_info['port']:5d} ({port_info['service']:15s}) → {port_info['count']:5,} 次 ({port_info['percentage']:.1f}%)")
+            print()
         else:
             print()
 
@@ -839,19 +990,43 @@ class AnomalyVerifier:
             else:
                 print(f"   ⚠️  來源高度集中（被少數來源大量連線）")
 
-        # 顯示所有目的地/來源（最多20個）
-        num_to_show = min(20, len(dst['top_destinations']))
-        print(f"\n   連線次數最多的前 {num_to_show} 個{top_label}:")
-        for dst_info in dst['top_destinations'][:num_to_show]:
-            ip_display = dst_info['ip']
-            if ip_display in ['0.0.0.0', '::']:
-                ip_display += " (數據缺失)"
-            print(f"      {ip_display:30s} → {dst_info['count']:5,} 次 ({dst_info['percentage']:.1f}%)")
+        # 顯示 TOP 5 目的地/來源（突出顯示）
+        if dst['top_destinations']:
+            # 動態調整標題：如果少於5個，顯示實際數量
+            num_to_display = min(5, len(dst['top_destinations']))
+            if num_to_display == len(dst['top_destinations']) and num_to_display < 5:
+                # 如果總數少於5個，顯示實際數量
+                print(f"\n   連線次數最多的前 {num_to_display} 個{top_label}:")
+            else:
+                # 如果有5個以上，顯示 TOP 5
+                print(f"\n   🔝 TOP 5 連線{top_label}:")
 
-        # 如果還有更多，提示用戶
-        if len(dst['top_destinations']) > num_to_show:
-            remaining = len(dst['top_destinations']) - num_to_show
-            print(f"      ... 還有 {remaining} 個{top_label}")
+            for i, dst_info in enumerate(dst['top_destinations'][:5], 1):
+                ip = dst_info['ip']
+                if ip in ['0.0.0.0', '::']:
+                    ip_display = f"{ip} (數據缺失)"
+                else:
+                    ip_display = self._format_ip_with_name(ip)
+                print(f"      {i}. {ip_display:50s} → {dst_info['count']:5,} 次 ({dst_info['percentage']:.1f}%)")
+
+        # 顯示額外的目的地/來源（6-20名）
+        if len(dst['top_destinations']) > 5:
+            num_to_show = min(20, len(dst['top_destinations']))
+            remaining_to_show = num_to_show - 5
+            if remaining_to_show > 0:
+                print(f"\n   其他高頻{top_label}（6-{num_to_show}名）:")
+                for i, dst_info in enumerate(dst['top_destinations'][5:num_to_show], 6):
+                    ip = dst_info['ip']
+                    if ip in ['0.0.0.0', '::']:
+                        ip_display = f"{ip} (數據缺失)"
+                    else:
+                        ip_display = self._format_ip_with_name(ip)
+                    print(f"      {i}. {ip_display:50s} → {dst_info['count']:5,} 次 ({dst_info['percentage']:.1f}%)")
+
+            # 如果還有更多，提示用戶
+            if len(dst['top_destinations']) > num_to_show:
+                remaining = len(dst['top_destinations']) - num_to_show
+                print(f"      ... 還有 {remaining} 個{top_label}")
         print()
 
         # 通訊埠分析（根據角色動態標籤）
@@ -873,9 +1048,12 @@ class AnomalyVerifier:
                 print(f"   ⚠️  疑似被通訊埠掃描")
         if port['is_sequential_scan']:
             print(f"   ⚠️  檢測到連續通訊埠模式")
-        print(f"\n   連線次數最多的前 5 個{port_label}:")
-        for port_info in port['top_ports'][:5]:
-            print(f"      {port_info['port']:5d} ({port_info['service']:15s}) → {port_info['count']:5,} 次 ({port_info['percentage']:.1f}%)")
+
+        # 顯示 TOP 5 通訊埠
+        if port['top_ports']:
+            print(f"\n   🔝 TOP 5 {port_label}:")
+            for i, port_info in enumerate(port['top_ports'][:5], 1):
+                print(f"      {i}. {port_info['port']:5d} ({port_info['service']:15s}) → {port_info['count']:5,} 次 ({port_info['percentage']:.1f}%)")
         print()
 
         # 協定分析
@@ -941,9 +1119,17 @@ def main():
         print(f"❌ 無法連接到 Elasticsearch: {es_host}")
         sys.exit(1)
 
-    print(f"✓ 已連接到 Elasticsearch: {es_host}\n")
+    print(f"✓ 已連接到 Elasticsearch: {es_host}")
 
     verifier = AnomalyVerifier(es, config)
+
+    # 顯示 MySQL 連線狀態
+    if verifier.mysql_connected:
+        mysql_cfg = config.get('mysql', {})
+        print(f"✓ 已連接到 MySQL: {mysql_cfg.get('host')}:{mysql_cfg.get('port')} (設備名稱查詢已啟用)")
+    else:
+        print(f"○ MySQL 未連接 (設備名稱查詢功能停用)")
+    print()
 
     if args.auto:
         print(f"🤖 自動模式：分析最近檢測到的前 {args.top} 個異常\n")
