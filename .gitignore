@@ -96,3 +96,24 @@ realtime_detection.log
 
 # Keep model directory but ignore models
 !nad/models/.gitkeep
+
+# Web UI - Node.js
+nad_web_ui/frontend/node_modules/
+nad_web_ui/frontend/dist/
+nad_web_ui/frontend/.vscode/
+nad_web_ui/frontend/package-lock.json
+
+# Web UI - Python Backend
+nad_web_ui/backend/venv/
+nad_web_ui/backend/__pycache__/
+nad_web_ui/backend/*.pyc
+nad_web_ui/backend/logs/
+nad_web_ui/backend/reports/
+
+# Web UI - Sensitive config
+nad_web_ui/backend/config.py
+nad_web_ui/backend/.env
+
+# Config backups (timestamped)
+nad/config.yaml.backup.*
+nad/device_mapping.yaml.backup.*

@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""
+Flask 應用配置
+"""
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class Config:
+    """基礎配置"""
+
+    # Flask
+    SECRET_KEY = os.getenv('SECRET_KEY', 'dev-secret-key-change-in-production')
+    DEBUG = os.getenv('FLASK_DEBUG', 'True') == 'True'
+
+    # Elasticsearch
+    ES_HOST = os.getenv('ES_HOST', 'http://localhost:9200')
+    ES_USER = os.getenv('ES_USER', '')
+    ES_PASSWORD = os.getenv('ES_PASSWORD', '')
+    ES_TIMEOUT = 30
+
+    # NAD System Paths
+    NAD_BASE_PATH = os.getenv('NAD_BASE_PATH', '/home/kaisermac/snm_flow')
+    NAD_CONFIG_PATH = os.getenv('NAD_CONFIG_PATH', '/home/kaisermac/snm_flow/nad/config.yaml')
+    NAD_MODELS_PATH = os.getenv('NAD_MODELS_PATH', '/home/kaisermac/snm_flow/nad/models')
+
+    # Server
+    BACKEND_HOST = os.getenv('BACKEND_HOST', '0.0.0.0')
+    BACKEND_PORT = int(os.getenv('BACKEND_PORT', 5000))
+
+    # CORS
+    CORS_ORIGINS = ['http://localhost:5173', 'http://localhost:3000']
+
+    # Job Settings
+    JOB_CACHE_TTL = 3600  # 1 hour
+
+    # LLM Settings (for security analysis)
+    OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
+    LLM_MODEL = os.getenv('LLM_MODEL', 'gpt-4o-mini')  # or gpt-4o for better analysis
+    LLM_ENABLED = bool(os.getenv('OPENAI_API_KEY', ''))
+
+    # OpenRouter Settings (for multi-model support)
+    OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
+    OPENROUTER_API_BASE = 'https://openrouter.ai/api/v1'
+    OPENROUTER_SITE_URL = os.getenv('OPENROUTER_SITE_URL', 'http://localhost:5173')
+    OPENROUTER_APP_NAME = os.getenv('OPENROUTER_APP_NAME', 'NAD Web UI')
+
+    # Judge model for multi-model comparison (must be powerful model like GPT-4o)
+    JUDGE_MODEL = os.getenv('JUDGE_MODEL', 'gpt-4o')
+
+
+class DevelopmentConfig(Config):
+    """開發環境配置"""
+    DEBUG = True
+
+
+class ProductionConfig(Config):
+    """生產環境配置"""
+    DEBUG = False
+    # 生產環境應該使用更強的密鑰
+    SECRET_KEY = os.getenv('SECRET_KEY')
+    if not SECRET_KEY:
+        raise ValueError("Production requires SECRET_KEY environment variable")
+
+
+# 根據環境變數選擇配置
+config = {
+    'development': DevelopmentConfig,
+    'production': ProductionConfig,
+    'default': DevelopmentConfig
+}
