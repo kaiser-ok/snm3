@@ -45,6 +45,9 @@ class FeatureEngineer:
             # 設備類型特徵
             if 'device_type' in features_config:
                 names.extend(features_config['device_type'])
+            # 時間序列特徵
+            if 'time_series' in features_config:
+                names.extend(features_config['time_series'])
 
             return names
         else:
@@ -126,12 +129,13 @@ class FeatureEngineer:
 
         # 新增：檢測可能的服務器回應流量
         # 改進的特徵：低源通訊埠多樣性（固定服務埠）+ 高目的通訊埠多樣性（客戶端隨機埠）
+        # 使用可配置的閾值（支援自定義）
         features['is_likely_server_response'] = 1 if (
-            features['src_port_diversity'] < 0.1 and     # 源通訊埠很集中（服務器固定埠如 53, 389, 443）
-            features['dst_port_diversity'] > 0.3 and     # 目的通訊埠很分散（客戶端隨機埠）
-            features['unique_src_ports'] <= 100 and      # 源通訊埠數量少（服務埠，放寬到 100）
-            features['flow_count'] > 100 and             # 連線數足夠多
-            features['avg_bytes'] < 50000                # 平均流量不大（DNS/LDAP/Web 回應）
+            features['src_port_diversity'] < thresholds.get('server_response_src_port_diversity_max', 0.1) and
+            features['dst_port_diversity'] > thresholds.get('server_response_dst_port_diversity_min', 0.3) and
+            features['unique_src_ports'] <= thresholds.get('server_response_unique_src_ports_max', 100) and
+            features['flow_count'] > thresholds.get('server_response_flow_count_min', 100) and
+            features['avg_bytes'] < thresholds.get('server_response_avg_bytes_max', 50000)
         ) else 0
 
         # 4. 對數變換（處理偏態分布）
@@ -142,7 +146,65 @@ class FeatureEngineer:
         src_ip = agg_record.get('src_ip', '')
         features['device_type'] = self.device_classifier.get_device_type_code(src_ip)
 
+        # 6. 時間序列特徵（可選，從 time_bucket 提取）
+        # 只有在配置中啟用時才提取
+        if self.config and 'time_series' in self.config.features_config:
+            time_features = self._extract_time_features(agg_record.get('time_bucket'))
+            features.update(time_features)
+
         return features
+
+    def _extract_time_features(self, time_bucket: str) -> Dict:
+        """
+        從 time_bucket 提取簡單時間特徵（不需要查詢歷史數據）
+
+        Args:
+            time_bucket: 時間戳字符串（ISO 8601 格式）
+
+        Returns:
+            時間特徵字典
+        """
+        time_features = {}
+
+        try:
+            # 解析時間
+            dt = datetime.fromisoformat(time_bucket.replace('Z', '+00:00'))
+
+            # 1. 小時（0-23）- 循環編碼
+            hour = dt.hour
+            time_features['hour_of_day'] = hour
+            time_features['hour_sin'] = np.sin(2 * np.pi * hour / 24)
+            time_features['hour_cos'] = np.cos(2 * np.pi * hour / 24)
+
+            # 2. 星期幾（0-6，0=Monday）
+            day_of_week = dt.weekday()
+            time_features['day_of_week'] = day_of_week
+
+            # 3. 是否週末（Saturday=5, Sunday=6）
+            time_features['is_weekend'] = 1 if day_of_week >= 5 else 0
+
+            # 4. 是否工作時間（週一到週五 9:00-18:00）
+            is_weekday = day_of_week < 5
+            is_work_hours = 9 <= hour < 18
+            time_features['is_business_hours'] = 1 if (is_weekday and is_work_hours) else 0
+
+            # 5. 是否深夜時段（22:00-06:00）
+            is_late_night = hour >= 22 or hour < 6
+            time_features['is_late_night'] = 1 if is_late_night else 0
+
+        except Exception as e:
+            # 如果解析失敗，返回默認值
+            time_features = {
+                'hour_of_day': 0,
+                'hour_sin': 0,
+                'hour_cos': 1,
+                'day_of_week': 0,
+                'is_weekend': 0,
+                'is_business_hours': 0,
+                'is_late_night': 0
+            }
+
+        return time_features
 
     def extract_features_batch(self, agg_records: List[Dict]) -> np.ndarray:
         """

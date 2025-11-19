@@ -25,49 +25,75 @@ class FeatureEngineerDst:
     def __init__(self, config=None):
         self.config = config
 
-        # 特徵名稱列表（用於參考）
-        self.feature_names = [
-            # 基礎特徵（from by_dst aggregation）
-            'unique_srcs',           # 來源 IP 數量
-            'unique_src_ports',      # 來源端口數量
-            'unique_dst_ports',      # 目標端口數量（被連接的端口）
-            'flow_count',            # 連線數
-            'total_bytes',           # 總流量
-            'total_packets',         # 總封包數
-            'avg_bytes',             # 平均封包大小
-            'max_bytes',             # 最大封包大小
+        # 特徵名稱列表（動態構建）
+        self.feature_names = self._build_feature_names()
 
+    def _build_feature_names(self):
+        """構建特徵名稱列表（從配置或使用預設值）"""
+        if self.config:
+            features_config = self.config.features_by_dst_config
+
+            names = []
+            # 基礎特徵
+            if 'basic' in features_config:
+                names.extend(features_config['basic'])
             # 衍生特徵
-            'flows_per_src',         # 每個來源的平均連線數
-            'bytes_per_src',         # 每個來源的平均流量
-            'packets_per_src',       # 每個來源的平均封包數
-            'bytes_per_flow',        # 每個連線的平均流量
-            'packets_per_flow',      # 每個連線的平均封包數
-            'src_port_diversity',    # 來源端口多樣性（unique_src_ports / unique_srcs）
-            'dst_port_diversity',    # 目標端口多樣性（unique_dst_ports / unique_srcs）
+            if 'derived' in features_config:
+                names.extend(features_config['derived'])
+            # 二值特徵
+            if 'binary' in features_config:
+                names.extend(features_config['binary'])
+            # 對數特徵
+            if 'log_transform' in features_config:
+                names.extend(features_config['log_transform'])
+            # 時間序列特徵
+            if 'time_series' in features_config:
+                names.extend(features_config['time_series'])
 
-            # 流量特徵
-            'traffic_concentration', # 流量集中度（total_bytes / unique_srcs）
+            return names
+        else:
+            # 默認特徵集（向後兼容）
+            return [
+                # 基礎特徵
+                'unique_srcs', 'unique_src_ports', 'unique_dst_ports',
+                'flow_count', 'total_bytes', 'total_packets',
+                'avg_bytes', 'max_bytes',
+                # 衍生特徵
+                'flows_per_src', 'bytes_per_src', 'packets_per_src',
+                'bytes_per_flow', 'packets_per_flow',
+                'src_port_diversity', 'dst_port_diversity',
+                'traffic_concentration', 'port_attack_breadth',
+                'avg_src_activity', 'bytes_per_packet',
+                # 二值特徵
+                'is_ddos_target', 'is_scan_target', 'is_high_receiver',
+                'is_likely_server', 'is_abnormal_pattern',
+                'is_port_concentrated', 'is_multi_port_attack',
+                # 對數特徵
+                'log_unique_srcs', 'log_flow_count', 'log_total_bytes',
+            ]
 
-            # 進階衍生特徵（新增）
-            'port_attack_breadth',   # 端口被攻擊廣度（unique_dst_ports / flow_count）
-            'avg_src_activity',      # 平均來源活躍度（flow_count / unique_srcs）
-            'bytes_per_packet',      # 每封包位元組數（total_bytes / total_packets）
-
-            # 二值行為特徵（新增）
-            'is_ddos_target',        # 偵測 DDoS 攻擊目標
-            'is_scan_target',        # 偵測被掃描目標
-            'is_high_receiver',      # 偵測高流量接收
-            'is_likely_server',      # 偵測服務器行為（正常）
-            'is_abnormal_pattern',   # 偵測異常連線模式
-            'is_port_concentrated',  # 偵測端口集中（正常服務）
-            'is_multi_port_attack',  # 偵測多端口攻擊
-
-            # 對數特徵（新增）
-            'log_unique_srcs',       # 對數轉換的來源數量
-            'log_flow_count',        # 對數轉換的連線數
-            'log_total_bytes',       # 對數轉換的總流量
-        ]
+    def _get_default_thresholds(self):
+        """獲取預設閾值"""
+        return {
+            'ddos_min_srcs': 100,
+            'ddos_max_flows_per_src': 5,
+            'ddos_max_avg_bytes': 1000,
+            'scan_min_dst_ports': 50,
+            'scan_max_avg_bytes': 5000,
+            'scan_max_packets_per_flow': 10,
+            'high_receiver_min_bytes': 100_000_000,
+            'high_receiver_min_bytes_per_src': 1_000_000,
+            'server_min_srcs': 10,
+            'server_max_dst_ports': 5,
+            'server_max_dst_port_diversity': 0.1,
+            'server_min_flows_per_src': 5,
+            'abnormal_max_srcs': 5,
+            'abnormal_min_flow_count': 1000,
+            'abnormal_min_src_port_diversity': 0.8,
+            'port_concentrated_max_dst_ports': 3,
+            'multi_port_min_dst_ports': 20,
+            'multi_port_min_flow_count': 500
+        }
 
     def extract_features(self, record: Dict) -> np.ndarray:
         """
@@ -109,30 +135,14 @@ class FeatureEngineerDst:
         avg_src_activity = flow_count / unique_srcs_safe
         bytes_per_packet = total_bytes / total_packets_safe
 
-        # 取得閾值設定（使用 config 或預設值）
-        if self.config and hasattr(self.config, 'thresholds'):
-            thresholds = self.config.thresholds
+        # 取得閾值設定（優先使用 thresholds_by_dst，否則使用預設值）
+        if self.config and hasattr(self.config, 'thresholds_by_dst'):
+            thresholds = self.config.thresholds_by_dst
+            # 如果 thresholds_by_dst 為空，使用預設值
+            if not thresholds:
+                thresholds = self._get_default_thresholds()
         else:
-            thresholds = {
-                'ddos_min_srcs': 100,
-                'ddos_max_flows_per_src': 5,
-                'ddos_max_avg_bytes': 1000,
-                'scan_min_dst_ports': 50,
-                'scan_max_avg_bytes': 5000,
-                'scan_max_packets_per_flow': 10,
-                'high_receiver_min_bytes': 100_000_000,
-                'high_receiver_min_bytes_per_src': 1_000_000,
-                'server_min_srcs': 10,
-                'server_max_dst_ports': 5,
-                'server_max_dst_port_diversity': 0.1,
-                'server_min_flows_per_src': 5,
-                'abnormal_max_srcs': 5,
-                'abnormal_min_flow_count': 1000,
-                'abnormal_min_src_port_diversity': 0.8,
-                'port_concentrated_max_dst_ports': 3,
-                'multi_port_min_dst_ports': 20,
-                'multi_port_min_flow_count': 500
-            }
+            thresholds = self._get_default_thresholds()
 
         # 二值行為特徵
         # 1. DDoS 攻擊目標檢測
@@ -187,45 +197,47 @@ class FeatureEngineerDst:
         log_flow_count = np.log1p(flow_count)
         log_total_bytes = np.log1p(total_bytes)
 
-        # 組合特徵向量（按照 feature_names 順序）
-        features = [
+        # 所有可能的特徵值（放在字典中）
+        all_features = {
             # 基礎特徵
-            unique_srcs,
-            unique_src_ports,
-            unique_dst_ports,
-            flow_count,
-            total_bytes,
-            total_packets,
-            avg_bytes,
-            max_bytes,
+            'unique_srcs': unique_srcs,
+            'unique_src_ports': unique_src_ports,
+            'unique_dst_ports': unique_dst_ports,
+            'flow_count': flow_count,
+            'total_bytes': total_bytes,
+            'total_packets': total_packets,
+            'avg_bytes': avg_bytes,
+            'max_bytes': max_bytes,
             # 衍生特徵
-            flows_per_src,
-            bytes_per_src,
-            packets_per_src,
-            bytes_per_flow,
-            packets_per_flow,
-            src_port_diversity,
-            dst_port_diversity,
-            traffic_concentration,
-            # 進階衍生特徵
-            port_attack_breadth,
-            avg_src_activity,
-            bytes_per_packet,
-            # 二值行為特徵
-            is_ddos_target,
-            is_scan_target,
-            is_high_receiver,
-            is_likely_server,
-            is_abnormal_pattern,
-            is_port_concentrated,
-            is_multi_port_attack,
+            'flows_per_src': flows_per_src,
+            'bytes_per_src': bytes_per_src,
+            'packets_per_src': packets_per_src,
+            'bytes_per_flow': bytes_per_flow,
+            'packets_per_flow': packets_per_flow,
+            'src_port_diversity': src_port_diversity,
+            'dst_port_diversity': dst_port_diversity,
+            'traffic_concentration': traffic_concentration,
+            'port_attack_breadth': port_attack_breadth,
+            'avg_src_activity': avg_src_activity,
+            'bytes_per_packet': bytes_per_packet,
+            # 二值特徵
+            'is_ddos_target': is_ddos_target,
+            'is_scan_target': is_scan_target,
+            'is_high_receiver': is_high_receiver,
+            'is_likely_server': is_likely_server,
+            'is_abnormal_pattern': is_abnormal_pattern,
+            'is_port_concentrated': is_port_concentrated,
+            'is_multi_port_attack': is_multi_port_attack,
             # 對數特徵
-            log_unique_srcs,
-            log_flow_count,
-            log_total_bytes,
-        ]
+            'log_unique_srcs': log_unique_srcs,
+            'log_flow_count': log_flow_count,
+            'log_total_bytes': log_total_bytes,
+        }
 
-        return np.array(features, dtype=np.float64)
+        # 根據 feature_names 構建特徵向量
+        feature_vector = [all_features.get(name, 0) for name in self.feature_names]
+
+        return np.array(feature_vector, dtype=np.float64)
 
     def extract_features_batch(self, records: List[Dict]) -> np.ndarray:
         """

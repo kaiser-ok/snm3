@@ -84,9 +84,8 @@ def start_training():
         days = data.get('days', 3)
         n_estimators = data.get('n_estimators', 150)
         contamination = data.get('contamination', 0.05)
-        exclude_servers = data.get('exclude_servers', False)
         anomaly_threshold = data.get('anomaly_threshold', 0.6)
-        mode = data.get('mode', 'by_src')  # 新增模式參數
+        mode = data.get('mode', 'by_src')
 
         # 驗證輸入
         if not (1 <= days <= 14):
@@ -124,7 +123,6 @@ def start_training():
             days=days,
             n_estimators=n_estimators,
             contamination=contamination,
-            exclude_servers=exclude_servers,
             anomaly_threshold=anomaly_threshold,
             mode=mode
         )
@@ -190,3 +188,129 @@ def get_history():
         'status': 'success',
         'history': history
     })
+
+
+@training_bp.route('/api/training/features', methods=['GET'])
+def get_available_features():
+    """
+    獲取可用特徵列表
+
+    Query Parameters:
+        mode: 'by_src', 'by_dst' (默認 'by_src')
+
+    Returns:
+        可用特徵列表，按類別分組
+    """
+    try:
+        mode = request.args.get('mode', 'by_src')
+        service = init_training_service()
+        result = service.get_available_features(mode=mode)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
+
+@training_bp.route('/api/training/features', methods=['PUT'])
+def update_feature_selection():
+    """
+    更新特徵選擇配置
+
+    Request Body:
+        {
+            "mode": "by_src" or "by_dst",
+            "selected_features": {
+                "basic": ["flow_count", "total_bytes", ...],
+                "derived": ["dst_diversity", ...],
+                "binary": ["is_high_connection", ...],
+                "log_transform": ["log_flow_count", ...],
+                "device_type": ["device_type"]
+            }
+        }
+    """
+    try:
+        data = request.get_json()
+        mode = data.get('mode', 'by_src')
+        selected_features = data.get('selected_features', {})
+
+        if not selected_features:
+            return jsonify({
+                'status': 'error',
+                'error': '必須選擇至少一個特徵'
+            }), 400
+
+        # 計算總特徵數
+        total_selected = sum(len(features) for features in selected_features.values())
+        if total_selected < 3:
+            return jsonify({
+                'status': 'error',
+                'error': '至少需要選擇 3 個特徵'
+            }), 400
+
+        service = init_training_service()
+        result = service.update_feature_selection(mode=mode, selected_features=selected_features)
+
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
+@training_bp.route('/api/training/thresholds', methods=['GET'])
+def get_thresholds():
+    """
+    獲取當前閾值配置
+    """
+    try:
+        service = init_training_service()
+        result = service.get_thresholds()
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
+
+@training_bp.route('/api/training/thresholds', methods=['PUT'])
+def update_thresholds():
+    """
+    更新閾值配置
+
+    Request Body:
+        {
+            "high_connection": 352,
+            "large_flow": 7914975,
+            "scanning_avg_bytes": 2200,
+            "scanning_dsts": 3,
+            "small_packet": 456,
+            "server_response_src_port_diversity_max": 0.1,
+            "server_response_dst_port_diversity_min": 0.3,
+            "server_response_unique_src_ports_max": 100,
+            "server_response_flow_count_min": 100,
+            "server_response_avg_bytes_max": 50000
+        }
+    """
+    try:
+        data = request.get_json()
+
+        if not data:
+            return jsonify({
+                'status': 'error',
+                'error': '必須提供閾值配置'
+            }), 400
+
+        service = init_training_service()
+        result = service.update_thresholds(data)
+
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500

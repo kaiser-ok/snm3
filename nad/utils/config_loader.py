@@ -66,6 +66,16 @@ class Config:
         return self._config['thresholds']
 
     @property
+    def features_by_dst_config(self):
+        """By Dst 特徵配置"""
+        return self._config.get('features_by_dst', self._config['features'])  # 向後兼容
+
+    @property
+    def thresholds_by_dst(self):
+        """By Dst 閾值配置"""
+        return self._config.get('thresholds_by_dst', {})
+
+    @property
     def output_config(self):
         return self._config['output']
 

@@ -107,17 +107,9 @@
                 {{ formatTrainedDate(trainingStore.configBySrc.model_info.trained_at) }}
               </el-descriptions-item>
               <el-descriptions-item label="特徵數量">
-                <div v-if="trainingStore.configBySrc.model_info?.n_features" style="display: flex; align-items: center; gap: 8px;">
-                  <span>{{ trainingStore.configBySrc.model_info.n_features }}</span>
-                  <el-button
-                    v-if="trainingStore.configBySrc.model_info?.feature_names"
-                    size="small"
-                    text
-                    @click="showFeaturesBySrc = !showFeaturesBySrc"
-                  >
-                    {{ showFeaturesBySrc ? '隱藏特徵' : '查看特徵' }}
-                  </el-button>
-                </div>
+                <span v-if="trainingStore.configBySrc.model_info?.n_features">
+                  {{ trainingStore.configBySrc.model_info.n_features }}
+                </span>
                 <el-text v-else type="info">無法取得</el-text>
               </el-descriptions-item>
               <el-descriptions-item>
@@ -289,22 +281,19 @@
               </el-col>
             </el-row>
 
-            <el-form-item>
-              <template #label>
-                <span>排除伺服器回應流量</span>
-                <el-tooltip placement="top" raw-content>
-                  <template #content>
-                    <div style="max-width: 300px;">
-                      過濾伺服器回應流量，<br/>
-                      專注分析客戶端異常行為
-                    </div>
-                  </template>
-                  <el-icon style="margin-left: 4px; cursor: help;">
-                    <InfoFilled />
-                  </el-icon>
-                </el-tooltip>
-              </template>
-              <el-switch v-model="excludeServers" />
+
+            <!-- 特徵選擇按鈕 -->
+            <el-form-item label="訓練特徵選擇">
+              <el-button
+                @click="openFeatureSelector('by_src')"
+                :icon="Edit"
+                style="width: 100%;"
+              >
+                自訂訓練特徵
+              </el-button>
+              <div style="font-size: 12px; color: #909399; margin-top: 4px;">
+                {{ trainingStore.configBySrc?.model_info?.n_features || '...' }} 個特徵已選擇（含二值特徵閾值編輯）
+              </div>
             </el-form-item>
 
             <!-- 操作按鈕 -->
@@ -337,26 +326,6 @@
         </el-card>
       </el-col>
     </el-row>
-
-    <!-- 特徵列表 - By Src -->
-    <el-card v-if="showFeaturesBySrc && trainingStore.configBySrc?.model_info?.feature_names" shadow="never" class="features-card">
-      <template #header>
-        <div class="card-header">
-          <span>特徵工程列表 - By Src（{{ trainingStore.configBySrc.model_info.feature_names.length }} 個特徵）</span>
-        </div>
-      </template>
-
-      <div class="features-grid">
-        <el-tag
-          v-for="(feature, index) in trainingStore.configBySrc.model_info.feature_names"
-          :key="index"
-          class="feature-tag"
-          type="info"
-        >
-          {{ index + 1 }}. {{ feature }}
-        </el-tag>
-      </div>
-    </el-card>
 
     <!-- 訓練進度 - By Src -->
     <el-card v-if="trainingStore.trainingBySrc || trainingStore.progressBySrc.percent > 0" shadow="never" class="progress-card">
@@ -472,17 +441,9 @@
                 {{ formatTrainedDate(trainingStore.configByDst.model_info.trained_at) }}
               </el-descriptions-item>
               <el-descriptions-item label="特徵數量">
-                <div v-if="trainingStore.configByDst.model_info?.n_features" style="display: flex; align-items: center; gap: 8px;">
-                  <span>{{ trainingStore.configByDst.model_info.n_features }}</span>
-                  <el-button
-                    v-if="trainingStore.configByDst.model_info?.feature_names"
-                    size="small"
-                    text
-                    @click="showFeaturesByDst = !showFeaturesByDst"
-                  >
-                    {{ showFeaturesByDst ? '隱藏特徵' : '查看特徵' }}
-                  </el-button>
-                </div>
+                <span v-if="trainingStore.configByDst.model_info?.n_features">
+                  {{ trainingStore.configByDst.model_info.n_features }}
+                </span>
                 <el-text v-else type="info">無法取得</el-text>
               </el-descriptions-item>
               <el-descriptions-item>
@@ -654,22 +615,19 @@
               </el-col>
             </el-row>
 
-            <el-form-item>
-              <template #label>
-                <span>排除伺服器回應流量</span>
-                <el-tooltip placement="top" raw-content>
-                  <template #content>
-                    <div style="max-width: 300px;">
-                      過濾伺服器回應流量，<br/>
-                      專注分析客戶端異常行為
-                    </div>
-                  </template>
-                  <el-icon style="margin-left: 4px; cursor: help;">
-                    <InfoFilled />
-                  </el-icon>
-                </el-tooltip>
-              </template>
-              <el-switch v-model="excludeServers" />
+
+            <!-- 特徵選擇按鈕 -->
+            <el-form-item label="訓練特徵選擇">
+              <el-button
+                @click="openFeatureSelector('by_dst')"
+                :icon="Edit"
+                style="width: 100%;"
+              >
+                自訂訓練特徵
+              </el-button>
+              <div style="font-size: 12px; color: #909399; margin-top: 4px;">
+                {{ trainingStore.configByDst?.model_info?.n_features || '...' }} 個特徵已選擇（含二值特徵閾值編輯）
+              </div>
             </el-form-item>
 
             <!-- 操作按鈕 -->
@@ -702,26 +660,6 @@
         </el-card>
       </el-col>
     </el-row>
-
-    <!-- 特徵列表 - By Dst -->
-    <el-card v-if="showFeaturesByDst && trainingStore.configByDst?.model_info?.feature_names" shadow="never" class="features-card">
-      <template #header>
-        <div class="card-header">
-          <span>特徵工程列表 - By Dst（{{ trainingStore.configByDst.model_info.feature_names.length }} 個特徵）</span>
-        </div>
-      </template>
-
-      <div class="features-grid">
-        <el-tag
-          v-for="(feature, index) in trainingStore.configByDst.model_info.feature_names"
-          :key="index"
-          class="feature-tag"
-          type="info"
-        >
-          {{ index + 1 }}. {{ feature }}
-        </el-tag>
-      </div>
-    </el-card>
 
     <!-- 訓練進度 - By Dst -->
     <el-card v-if="trainingStore.trainingByDst || trainingStore.progressByDst.percent > 0" shadow="never" class="progress-card">
@@ -1109,6 +1047,13 @@
         <el-button type="primary" @click="saveDeviceType">存檔</el-button>
       </template>
     </el-dialog>
+
+    <!-- 特徵選擇器 -->
+    <FeatureSelector
+      v-model="featureSelectorVisible"
+      :mode="currentMode"
+      @saved="handleFeatureSaved"
+    />
   </div>
 </template>
 
@@ -1118,6 +1063,7 @@ import { useTrainingStore } from '@/stores/training'
 import { VideoPlay, InfoFilled, RefreshLeft, Refresh, Plus, Edit, Delete } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import axios from 'axios'
+import FeatureSelector from '@/components/FeatureSelector.vue'
 
 const trainingStore = useTrainingStore()
 
@@ -1126,21 +1072,20 @@ const DEFAULT_VALUES = {
   trainingDays: 3,
   nEstimators: 150,
   contamination: 0.05,
-  anomalyThreshold: 0.6,
-  excludeServers: false
+  anomalyThreshold: 0.6
 }
 
 const trainingDays = ref(DEFAULT_VALUES.trainingDays)
 const nEstimators = ref(DEFAULT_VALUES.nEstimators)
 const contamination = ref(DEFAULT_VALUES.contamination)
 const anomalyThreshold = ref(DEFAULT_VALUES.anomalyThreshold)
-const excludeServers = ref(DEFAULT_VALUES.excludeServers)
-const showFeatures = ref(false)
 
 // 雙模式支援
 const activeMode = ref('by_src')
-const showFeaturesBySrc = ref(false)
-const showFeaturesByDst = ref(false)
+
+// 特徵選擇器
+const featureSelectorVisible = ref(false)
+const currentMode = ref('by_src')
 
 // 設備映射相關
 const deviceMappingLoading = ref(false)
@@ -1196,6 +1141,19 @@ function getDeviceTypeName(type) {
 
 function isProtectedType(type) {
   return protectedTypes.includes(type)
+}
+
+// 特徵選擇器相關函數
+function openFeatureSelector(mode) {
+  currentMode.value = mode
+  featureSelectorVisible.value = true
+}
+
+function handleFeatureSaved() {
+  ElMessage.success('特徵設定已更新')
+  // 重新載入配置以更新特徵數量顯示
+  trainingStore.loadConfig('by_src')
+  trainingStore.loadConfig('by_dst')
 }
 
 function openCreateDeviceTypeDialog() {
@@ -1485,9 +1443,8 @@ async function handleStartTraining(mode = 'by_src') {
     days: trainingDays.value,
     n_estimators: nEstimators.value,
     contamination: contamination.value,
-    exclude_servers: excludeServers.value,
     anomaly_threshold: anomalyThreshold.value,
-    mode: mode  // 添加模式參數
+    mode: mode
   })
 }
 

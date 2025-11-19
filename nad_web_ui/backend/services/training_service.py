@@ -175,7 +175,7 @@ class TrainingService:
                 'error': str(e)
             }
 
-    def start_training(self, days: int = 3, n_estimators: int = 150, contamination: float = 0.05, exclude_servers: bool = False, anomaly_threshold: float = 0.6, mode: str = 'by_src') -> str:
+    def start_training(self, days: int = 3, n_estimators: int = 150, contamination: float = 0.05, anomaly_threshold: float = 0.6, mode: str = 'by_src') -> str:
         """
         開始模型訓練（背景執行）
 
@@ -183,7 +183,6 @@ class TrainingService:
             days: 訓練資料天數
             n_estimators: 決策樹數量
             contamination: 污染率
-            exclude_servers: 是否排除伺服器回應流量
             anomaly_threshold: 異常偵測閾值
             mode: 訓練模式 ('by_src' 或 'by_dst')
 
@@ -201,7 +200,6 @@ class TrainingService:
                 'days': days,
                 'n_estimators': n_estimators,
                 'contamination': contamination,
-                'exclude_servers': exclude_servers,
                 'anomaly_threshold': anomaly_threshold,
                 'mode': mode
             },
@@ -217,7 +215,7 @@ class TrainingService:
         self.jobs[job_id] = job
 
         # 在背景執行緒中執行訓練
-        thread = threading.Thread(target=self._train_worker, args=(job_id, days, n_estimators, contamination, exclude_servers, anomaly_threshold, mode))
+        thread = threading.Thread(target=self._train_worker, args=(job_id, days, n_estimators, contamination, anomaly_threshold, mode))
         thread.daemon = True
         thread.start()
 
@@ -225,7 +223,7 @@ class TrainingService:
 
         return job_id
 
-    def _train_worker(self, job_id: str, days: int, n_estimators: int, contamination: float, exclude_servers: bool, anomaly_threshold: float = 0.6, mode: str = 'by_src'):
+    def _train_worker(self, job_id: str, days: int, n_estimators: int, contamination: float, anomaly_threshold: float = 0.6, mode: str = 'by_src'):
         """
         訓練工作執行緒
 
@@ -234,7 +232,6 @@ class TrainingService:
             days: 訓練天數
             n_estimators: 決策樹數量
             contamination: 污染率
-            exclude_servers: 排除伺服器
             anomaly_threshold: 異常偵測閾值
             mode: 訓練模式 ('by_src' 或 'by_dst')
         """
@@ -363,7 +360,7 @@ class TrainingService:
             progress_thread.start()
 
             # 實際執行訓練
-            detector.train_on_aggregated_data(days=days, exclude_servers=exclude_servers)
+            detector.train_on_aggregated_data(days=days)
             training_time = (datetime.now() - start_time).total_seconds()
 
             # Step 6: 保存模型 (95-98%)
@@ -461,3 +458,279 @@ class TrainingService:
         # 按完成時間排序（最新在前）
         history.sort(key=lambda x: x.get('completed_at', ''), reverse=True)
         return history
+
+    def get_available_features(self, mode: str = 'by_src') -> Dict:
+        """
+        獲取可用特徵列表（按類別分組）
+
+        Args:
+            mode: 'by_src' 或 'by_dst'
+
+        Returns:
+            可用特徵列表和當前選擇狀態
+        """
+        try:
+            # 讀取配置
+            with open(self.nad_config_path, 'r', encoding='utf-8') as f:
+                config_data = yaml.safe_load(f)
+
+            # 根據模式選擇特徵集合
+            if mode == 'by_dst':
+                # By Dst 特徵列表
+                available_features = {
+                    'basic': {
+                        'unique_srcs': {'name': '不同來源數', 'description': '唯一來源 IP 數量'},
+                        'unique_src_ports': {'name': '不同源埠數', 'description': '唯一源通訊埠數量'},
+                        'unique_dst_ports': {'name': '不同目的埠數', 'description': '唯一目的通訊埠數量'},
+                        'flow_count': {'name': '連線數', 'description': '5分鐘內的總連線數'},
+                        'total_bytes': {'name': '總流量', 'description': '總傳輸位元組數'},
+                        'total_packets': {'name': '總封包數', 'description': '總封包數量'},
+                        'avg_bytes': {'name': '平均流量', 'description': '每連線平均位元組數'},
+                        'max_bytes': {'name': '最大流量', 'description': '單一連線最大位元組數'},
+                    },
+                    'derived': {
+                        'flows_per_src': {'name': '每來源連線數', 'description': '連線數 / 來源數'},
+                        'bytes_per_src': {'name': '每來源流量', 'description': '總流量 / 來源數'},
+                        'packets_per_src': {'name': '每來源封包數', 'description': '總封包數 / 來源數'},
+                        'bytes_per_flow': {'name': '每連線流量', 'description': '總流量 / 連線數'},
+                        'packets_per_flow': {'name': '每連線封包數', 'description': '總封包數 / 連線數'},
+                        'src_port_diversity': {'name': '源埠分散度', 'description': '源埠數 / 來源數'},
+                        'dst_port_diversity': {'name': '目的埠分散度', 'description': '目的埠數 / 來源數'},
+                        'traffic_concentration': {'name': '流量集中度', 'description': '總流量 / 來源數'},
+                        'port_attack_breadth': {'name': '端口攻擊廣度', 'description': '目的埠數 / 連線數'},
+                        'avg_src_activity': {'name': '平均來源活躍度', 'description': '連線數 / 來源數'},
+                        'bytes_per_packet': {'name': '每封包位元組數', 'description': '總流量 / 總封包數'},
+                    },
+                    'binary': {
+                        'is_ddos_target': {'name': 'DDoS 目標標記', 'description': '疑似 DDoS 攻擊目標'},
+                        'is_scan_target': {'name': '掃描目標標記', 'description': '疑似被掃描目標'},
+                        'is_high_receiver': {'name': '高流量接收標記', 'description': '接收大量流量'},
+                        'is_likely_server': {'name': '伺服器標記', 'description': '疑似伺服器行為'},
+                        'is_abnormal_pattern': {'name': '異常模式標記', 'description': '異常連線模式'},
+                        'is_port_concentrated': {'name': '端口集中標記', 'description': '端口使用集中'},
+                        'is_multi_port_attack': {'name': '多端口攻擊標記', 'description': '多端口被攻擊'},
+                    },
+                    'log_transform': {
+                        'log_unique_srcs': {'name': '來源數對數', 'description': 'log(來源數 + 1)'},
+                        'log_flow_count': {'name': '連線數對數', 'description': 'log(連線數 + 1)'},
+                        'log_total_bytes': {'name': '總流量對數', 'description': 'log(總流量 + 1)'},
+                    },
+                    'time_series': {
+                        'hour_of_day': {'name': '小時（原始）', 'description': '一天中的小時（0-23）'},
+                        'hour_sin': {'name': '小時（正弦）', 'description': '小時的正弦編碼（循環特徵）'},
+                        'hour_cos': {'name': '小時（餘弦）', 'description': '小時的餘弦編碼（循環特徵）'},
+                        'day_of_week': {'name': '星期幾', 'description': '週一到週日（0-6）'},
+                        'is_weekend': {'name': '週末標記', 'description': '是否為週末'},
+                        'is_business_hours': {'name': '工作時間標記', 'description': '是否為工作時間（週一至五 9-18點）'},
+                        'is_late_night': {'name': '深夜標記', 'description': '是否為深夜時段（22-6點）'},
+                    }
+                }
+                
+                # 從 features_by_dst 讀取當前配置
+                current_features = config_data.get('features_by_dst', {})
+            else:
+                # By Src 特徵列表
+                available_features = {
+                    'basic': {
+                        'flow_count': {'name': '連線數', 'description': '5分鐘內的總連線數'},
+                        'total_bytes': {'name': '總流量', 'description': '總傳輸位元組數'},
+                        'total_packets': {'name': '總封包數', 'description': '總封包數量'},
+                        'unique_dsts': {'name': '不同目的地數', 'description': '唯一目的 IP 數量'},
+                        'unique_src_ports': {'name': '不同源埠數', 'description': '唯一源通訊埠數量'},
+                        'unique_dst_ports': {'name': '不同目的埠數', 'description': '唯一目的通訊埠數量'},
+                        'avg_bytes': {'name': '平均流量', 'description': '每連線平均位元組數'},
+                        'max_bytes': {'name': '最大流量', 'description': '單一連線最大位元組數'},
+                    },
+                    'derived': {
+                        'dst_diversity': {'name': '目的地分散度', 'description': '目的地數 / 連線數'},
+                        'src_port_diversity': {'name': '源埠分散度', 'description': '源埠數 / 連線數'},
+                        'dst_port_diversity': {'name': '目的埠分散度', 'description': '目的埠數 / 連線數'},
+                        'traffic_concentration': {'name': '流量集中度', 'description': '最大流量 / 總流量'},
+                        'bytes_per_packet': {'name': '每封包位元組數', 'description': '總流量 / 總封包數'},
+                    },
+                    'binary': {
+                        'is_high_connection': {'name': '高連線數標記', 'description': '連線數超過閾值'},
+                        'is_scanning_pattern': {'name': '掃描模式標記', 'description': '符合掃描行為特徵'},
+                        'is_small_packet': {'name': '小封包標記', 'description': '平均封包大小較小'},
+                        'is_large_flow': {'name': '大流量標記', 'description': '最大流量超過閾值'},
+                        'is_likely_server_response': {'name': '伺服器回應標記', 'description': '可能是伺服器回應流量'},
+                    },
+                    'log_transform': {
+                        'log_flow_count': {'name': '連線數對數', 'description': 'log(連線數 + 1)'},
+                        'log_total_bytes': {'name': '總流量對數', 'description': 'log(總流量 + 1)'},
+                    },
+                    'device_type': {
+                        'device_type': {'name': '設備類型', 'description': 'IP 設備類型編碼'},
+                    },
+                    'time_series': {
+                        'hour_of_day': {'name': '小時（原始）', 'description': '一天中的小時（0-23）'},
+                        'hour_sin': {'name': '小時（正弦）', 'description': '小時的正弦編碼（循環特徵）'},
+                        'hour_cos': {'name': '小時（餘弦）', 'description': '小時的餘弦編碼（循環特徵）'},
+                        'day_of_week': {'name': '星期幾', 'description': '週一到週日（0-6）'},
+                        'is_weekend': {'name': '週末標記', 'description': '是否為週末'},
+                        'is_business_hours': {'name': '工作時間標記', 'description': '是否為工作時間（週一至五 9-18點）'},
+                        'is_late_night': {'name': '深夜標記', 'description': '是否為深夜時段（22-6點）'},
+                    }
+                }
+                
+                # 從 features 讀取當前配置
+                current_features = config_data.get('features', {})
+
+            # 如果配置中沒有特徵設定，使用所有可用特徵作為預設值
+            if not current_features:
+                current_features = {
+                    category: list(features.keys())
+                    for category, features in available_features.items()
+                }
+                # 時間序列特徵預設不啟用
+                current_features['time_series'] = []
+
+            # 確保所有類別都存在（向後兼容）
+            if 'time_series' not in current_features:
+                current_features['time_series'] = []
+
+            # 計算總數
+            total_available = sum(len(features) for features in available_features.values())
+            total_selected = sum(len(features) for features in current_features.values())
+
+            return {
+                'status': 'success',
+                'available_features': available_features,
+                'current_selection': current_features,
+                'total_available': total_available,
+                'total_selected': total_selected,
+                'mode': mode
+            }
+
+        except Exception as e:
+            return {
+                'status': 'error',
+                'error': str(e)
+            }
+
+    def update_feature_selection(self, mode: str, selected_features: Dict) -> Dict:
+        """
+        更新特徵選擇配置
+
+        Args:
+            mode: 'by_src' 或 'by_dst'
+            selected_features: 選中的特徵字典，格式如：
+                {
+                    "basic": ["flow_count", "total_bytes", ...],
+                    "derived": [...],
+                    ...
+                }
+
+        Returns:
+            更新結果
+        """
+        try:
+            # 建立備份
+            backup_path = f"{self.nad_config_path}.backup.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            shutil.copy2(self.nad_config_path, backup_path)
+
+            # 讀取現有配置
+            with open(self.nad_config_path, 'r', encoding='utf-8') as f:
+                config_data = yaml.safe_load(f)
+
+            # 根據模式更新對應的特徵配置
+            if mode == 'by_dst':
+                config_data['features_by_dst'] = selected_features
+            else:
+                config_data['features'] = selected_features
+
+            # 寫回檔案
+            with open(self.nad_config_path, 'w', encoding='utf-8') as f:
+                yaml.dump(config_data, f, allow_unicode=True, default_flow_style=False)
+
+            # 重新載入配置
+            self.config = load_config(self.nad_config_path)
+
+            # 統計選中的特徵數
+            total_selected = sum(len(features) for features in selected_features.values())
+
+            return {
+                'status': 'success',
+                'message': f'特徵選擇已更新（共 {total_selected} 個特徵）',
+                'backup_path': backup_path,
+                'selected_features': selected_features,
+                'total_selected': total_selected,
+                'mode': mode
+            }
+
+        except Exception as e:
+            return {
+                'status': 'error',
+                'error': str(e)
+            }
+
+    def get_thresholds(self) -> Dict:
+        """
+        獲取當前閾值配置
+
+        Returns:
+            閾值配置字典
+        """
+        try:
+            with open(self.nad_config_path, 'r', encoding='utf-8') as f:
+                config_data = yaml.safe_load(f)
+
+            thresholds = config_data.get('thresholds', {})
+
+            return {
+                'status': 'success',
+                'thresholds': thresholds
+            }
+
+        except Exception as e:
+            return {
+                'status': 'error',
+                'error': str(e)
+            }
+
+    def update_thresholds(self, new_thresholds: Dict) -> Dict:
+        """
+        更新閾值配置
+
+        Args:
+            new_thresholds: 新的閾值配置
+
+        Returns:
+            更新結果
+        """
+        try:
+            # 建立備份
+            backup_path = f"{self.nad_config_path}.backup.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            shutil.copy2(self.nad_config_path, backup_path)
+
+            # 讀取現有配置
+            with open(self.nad_config_path, 'r', encoding='utf-8') as f:
+                config_data = yaml.safe_load(f)
+
+            # 更新 thresholds 配置
+            if 'thresholds' not in config_data:
+                config_data['thresholds'] = {}
+
+            # 只更新提供的閾值
+            for key, value in new_thresholds.items():
+                config_data['thresholds'][key] = value
+
+            # 寫回檔案
+            with open(self.nad_config_path, 'w', encoding='utf-8') as f:
+                yaml.dump(config_data, f, allow_unicode=True, default_flow_style=False)
+
+            # 重新載入配置
+            self.config = load_config(self.nad_config_path)
+
+            return {
+                'status': 'success',
+                'message': '閾值配置已更新',
+                'backup_path': backup_path,
+                'thresholds': config_data['thresholds']
+            }
+
+        except Exception as e:
+            return {
+                'status': 'error',
+                'error': str(e)
+            }
