@@ -337,20 +337,30 @@ class IsolationForestByDst:
         return min(max(confidence, 0.5), 1.0)
 
     def _save_model(self):
-        """保存模型和 scaler"""
+        """保存模型、scaler 和特徵元數據"""
         # 確保目錄存在
         os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
 
-        # 保存模型
-        with open(self.model_path, 'wb') as f:
-            pickle.dump(self.model, f)
+        # 準備模型狀態（包含特徵元數據）
+        model_state = {
+            'model': self.model,
+            'feature_names': self.feature_engineer.get_feature_names(),
+            'n_features': self.feature_engineer.get_n_features(),
+            'trained_at': datetime.now().isoformat(),
+            'model_config': self.model_config,
+            'perspective': 'DST'
+        }
 
-        # 保存 scaler
+        # 保存模型狀態
+        with open(self.model_path, 'wb') as f:
+            pickle.dump(model_state, f)
+
+        # 保存 scaler（獨立文件）
         with open(self.scaler_path, 'wb') as f:
             pickle.dump(self.scaler, f)
 
     def _load_model(self):
-        """加載模型和 scaler"""
+        """加載模型和 scaler，並驗證特徵一致性"""
         if not os.path.exists(self.model_path):
             raise FileNotFoundError(
                 f"模型文件不存在: {self.model_path}\n"
@@ -358,8 +368,49 @@ class IsolationForestByDst:
             )
 
         with open(self.model_path, 'rb') as f:
-            self.model = pickle.load(f)
+            model_state = pickle.load(f)
 
+        # 向後兼容：如果是舊格式（直接保存 model），轉換為新格式
+        if isinstance(model_state, dict) and 'model' in model_state:
+            # 新格式：包含元數據
+            self.model = model_state['model']
+            saved_feature_names = model_state.get('feature_names')
+            saved_n_features = model_state.get('n_features')
+            trained_at = model_state.get('trained_at', 'Unknown')
+
+            # 驗證特徵一致性
+            current_feature_names = self.feature_engineer.get_feature_names()
+
+            if saved_feature_names is not None:
+                if saved_feature_names != current_feature_names:
+                    # 特徵漂移檢測
+                    raise ValueError(
+                        f"\n{'='*70}\n"
+                        f"⚠️  Feature Drift 檢測到特徵不一致 (By Dst 模型)！\n"
+                        f"{'='*70}\n\n"
+                        f"模型訓練時的特徵 ({saved_n_features} 個):\n  {saved_feature_names}\n\n"
+                        f"當前配置的特徵 ({len(current_feature_names)} 個):\n  {current_feature_names}\n\n"
+                        f"模型訓練時間: {trained_at}\n\n"
+                        f"可能原因:\n"
+                        f"  1. config.yaml 中的 features_by_dst 配置已被修改\n"
+                        f"  2. 特徵順序發生變化\n"
+                        f"  3. 新增或刪除了特徵\n\n"
+                        f"解決方案:\n"
+                        f"  1. 恢復 config.yaml 中的 features_by_dst 配置為訓練時的設定\n"
+                        f"  2. 或重新訓練 by_dst 模型以使用新的特徵配置\n"
+                        f"     指令: python3 train_isolation_forest_by_dst.py --days 7\n"
+                        f"{'='*70}\n"
+                    )
+
+                print(f"✓ 特徵一致性驗證通過 ({saved_n_features} 個特徵)")
+            else:
+                print("⚠️  警告：模型缺少特徵元數據（可能是舊版本訓練），無法進行特徵一致性檢查")
+        else:
+            # 舊格式：直接保存的 model 對象
+            self.model = model_state
+            print("⚠️  警告：載入舊格式模型（無特徵元數據），建議重新訓練")
+
+        # 載入 scaler
         with open(self.scaler_path, 'rb') as f:
             self.scaler = pickle.load(f)
 
