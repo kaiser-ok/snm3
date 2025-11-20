@@ -106,7 +106,7 @@ class OptimizedIsolationForest:
         if exclude_servers:
             print("🚫 Step 2.5: 過濾服務器回應流量...")
             # is_likely_server_response 是倒數第3個特徵（log_flow_count, log_total_bytes 之前）
-            server_response_idx = self.feature_engineer.feature_names.index('is_likely_server_response')
+            server_response_idx = self.feature_engineer.detection_feature_names.index('is_likely_server_response')
 
             # 找出不是服務器回應的樣本
             not_server_mask = X[:, server_response_idx] == 0
@@ -284,7 +284,8 @@ class OptimizedIsolationForest:
         results = []
         for i, (record, pred, score) in enumerate(zip(records, predictions, scores)):
             if pred == -1:  # 異常
-                features = self.feature_engineer.extract_features(record)
+                # 使用分類特徵提取器獲取更豐富的特徵
+                features = self.feature_engineer.extract_classification_features(record)
 
                 results.append({
                     'src_ip': record['src_ip'],
@@ -344,8 +345,8 @@ class OptimizedIsolationForest:
         # 準備模型狀態（包含特徵元數據）
         model_state = {
             'model': self.model,
-            'feature_names': self.feature_engineer.feature_names,
-            'n_features': len(self.feature_engineer.feature_names),
+            'feature_names': self.feature_engineer.detection_feature_names,
+            'n_features': len(self.feature_engineer.detection_feature_names),
             'trained_at': datetime.now().isoformat(),
             'model_config': self.model_config
         }
@@ -378,7 +379,7 @@ class OptimizedIsolationForest:
             trained_at = model_state.get('trained_at', 'Unknown')
 
             # 驗證特徵一致性
-            current_feature_names = self.feature_engineer.feature_names
+            current_feature_names = self.feature_engineer.detection_feature_names
 
             if saved_feature_names is not None:
                 if saved_feature_names != current_feature_names:
@@ -489,7 +490,8 @@ class OptimizedIsolationForest:
             'n_estimators': self.model.n_estimators,
             'contamination': self.model.contamination,
             'max_samples': self.model.max_samples,
-            'n_features': len(self.feature_engineer.feature_names),
-            'feature_names': self.feature_engineer.feature_names,
+            'max_samples': self.model.max_samples,
+            'n_features': len(self.feature_engineer.detection_feature_names),
+            'feature_names': self.feature_engineer.detection_feature_names,
             'model_path': self.model_path
         }

@@ -336,6 +336,11 @@ class AnomalyClassifier:
         dst_diversity = features.get('dst_diversity', 0)
         dst_port_diversity = features.get('dst_port_diversity', 0)
 
+        # 新增分類特徵
+        flow_rate = features.get('flow_rate', 0)
+        byte_rate = features.get('byte_rate', 0)
+        common_ports_ratio = features.get('common_ports_ratio', 0)
+
         # 二值特徵
         is_high_connection = features.get('is_high_connection', 0)
         is_scanning_pattern = features.get('is_scanning_pattern', 0)
@@ -481,13 +486,14 @@ class AnomalyClassifier:
         flow_count = features.get('flow_count', 0)
         avg_bytes = features.get('avg_bytes', 0)
         unique_dsts = features.get('unique_dsts', 0)
+        flow_rate = features.get('flow_rate', 0)
 
         # DDoS 特徵：
-        # 1. 極高連線數（> 10000）
+        # 1. 極高連線數（> 10000）或高連線速率（> 30/s）
         # 2. 極小封包（< 500 bytes）- SYN Flood
         # 3. 目的地少（< 20）
         return (
-            flow_count > 10000 and
+            (flow_count > 10000 or flow_rate > 30) and
             avg_bytes < 500 and
             unique_dsts < 20
         )
@@ -497,17 +503,18 @@ class AnomalyClassifier:
         total_bytes = features.get('total_bytes', 0)
         unique_dsts = features.get('unique_dsts', 0)
         dst_diversity = features.get('dst_diversity', 0)
+        byte_rate = features.get('byte_rate', 0)
 
         # 檢查是否有外部 IP
         has_external = any(not self._is_internal_ip(ip) for ip in dst_ips) if dst_ips else False
 
         # 數據外洩特徵：
-        # 1. 大流量（> 1GB）
+        # 1. 大流量（> 1GB）或高傳輸速率（> 3MB/s）
         # 2. 目的地極少（< 5）
         # 3. 目的地集中（diversity < 0.1）
         # 4. 有外部 IP
         return (
-            total_bytes > 1e9 and  # > 1GB
+            (total_bytes > 1e9 or byte_rate > 3e6) and  # > 1GB or > 3MB/s
             unique_dsts <= 5 and
             dst_diversity < 0.1 and
             has_external
@@ -624,12 +631,13 @@ class AnomalyClassifier:
         """計算 DDoS 的置信度"""
         flow_count = features.get('flow_count', 0)
         avg_bytes = features.get('avg_bytes', 0)
+        flow_rate = features.get('flow_rate', 0)
 
         confidence = 0.7
 
-        if flow_count > 50000:
+        if flow_count > 50000 or flow_rate > 100:
             confidence += 0.2
-        elif flow_count > 20000:
+        elif flow_count > 20000 or flow_rate > 50:
             confidence += 0.1
 
         if avg_bytes < 300:
@@ -642,13 +650,14 @@ class AnomalyClassifier:
         total_bytes = features.get('total_bytes', 0)
         unique_dsts = features.get('unique_dsts', 0)
         dst_diversity = features.get('dst_diversity', 0)
+        byte_rate = features.get('byte_rate', 0)
 
         confidence = 0.7
 
         # 流量越大，置信度越高
-        if total_bytes > 10e9:  # > 10GB
+        if total_bytes > 10e9 or byte_rate > 30e6:  # > 10GB or > 30MB/s
             confidence += 0.15
-        elif total_bytes > 5e9:  # > 5GB
+        elif total_bytes > 5e9 or byte_rate > 15e6:  # > 5GB or > 15MB/s
             confidence += 0.1
 
         # 目的地越集中，置信度越高

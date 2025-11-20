@@ -103,6 +103,7 @@ print("✓ Test 4: 測試 Isolation Forest 類結構...")
 try:
     from nad.ml.isolation_forest_detector import OptimizedIsolationForest
 
+    config = None
     detector = OptimizedIsolationForest(config)
 
     print(f"  - 模型配置: {detector.model_config}")

@@ -27,6 +27,10 @@ class FeatureEngineer:
 
         # 特徵名稱（順序很重要！）
         self.feature_names = self._build_feature_names()
+        
+        # 定義檢測用特徵和分類用特徵
+        self.detection_feature_names = self.feature_names  # 默認與 feature_names 相同
+        self.classification_feature_names = self._build_classification_feature_names()
 
     def _build_feature_names(self):
         """構建特徵名稱列表"""
@@ -72,6 +76,38 @@ class FeatureEngineer:
                 # 設備類型特徵 (1個) - 新增
                 'device_type'
             ]
+
+    def _build_classification_feature_names(self):
+        """構建分類特徵名稱列表（包含檢測特徵和額外特徵）"""
+        # 基礎特徵集（檢測用）
+        names = list(self.feature_names)
+        
+        # 如果配置中有定義分類特徵，則使用配置
+        if self.config and hasattr(self.config, 'classification_features_config') and self.config.classification_features_config:
+            extra_features = self.config.classification_features_config
+            names.extend(extra_features)
+            return names
+
+        # 默認額外分類特徵
+        extra_features = [
+            # 端口分析
+            'common_ports_ratio',      # 常用端口比例 (0-1023)
+            'dynamic_ports_ratio',     # 動態端口比例 (49152-65535)
+            'registered_ports_ratio',  # 註冊端口比例 (1024-49151)
+            
+            # 流量方向性 (如果有雙向數據)
+            # 'upload_download_ratio',
+            
+            # 協議分析 (如果有協議數據)
+            # 'tcp_ratio', 'udp_ratio', 'icmp_ratio'
+            
+            # 更細粒度的時間特徵
+            'flow_rate',               # 每秒連線數
+            'byte_rate'                # 每秒字節數
+        ]
+        
+        names.extend(extra_features)
+        return names
 
     def extract_features(self, agg_record: Dict) -> Dict:
         """
@@ -154,6 +190,37 @@ class FeatureEngineer:
 
         return features
 
+    def extract_classification_features(self, agg_record: Dict) -> Dict:
+        """
+        提取用於分類的完整特徵集（包含檢測特徵和額外特徵）
+        
+        Args:
+            agg_record: netflow_stats_5m 的一筆記錄
+            
+        Returns:
+            擴展的特徵字典
+        """
+        # 1. 獲取基礎特徵
+        features = self.extract_features(agg_record)
+        
+        # 2. 計算額外分類特徵
+        
+        # 端口分析 (需要原始數據支持，這裡做近似估計或預留接口)
+        # 由於聚合數據可能沒有詳細的端口列表，我們這裡只能做有限的推斷
+        # 如果將來聚合數據包含端口列表或位圖，這裡可以更精確
+        
+        # 暫時使用默認值，等待數據源改進
+        features['common_ports_ratio'] = 0.0
+        features['dynamic_ports_ratio'] = 0.0
+        features['registered_ports_ratio'] = 0.0
+        
+        # 速率特徵 (假設窗口為 5 分鐘 = 300 秒)
+        duration = 300
+        features['flow_rate'] = features['flow_count'] / duration
+        features['byte_rate'] = features['total_bytes'] / duration
+        
+        return features
+
     def _extract_time_features(self, time_bucket: str) -> Dict:
         """
         從 time_bucket 提取簡單時間特徵（不需要查詢歷史數據）
@@ -220,8 +287,9 @@ class FeatureEngineer:
 
         for record in agg_records:
             features = self.extract_features(record)
-            # 按照 feature_names 的順序構建特徵向量
-            feature_vector = [features[name] for name in self.feature_names]
+            features = self.extract_features(record)
+            # 按照 detection_feature_names 的順序構建特徵向量
+            feature_vector = [features[name] for name in self.detection_feature_names]
             features_list.append(feature_vector)
 
         return np.array(features_list)
@@ -236,7 +304,7 @@ class FeatureEngineer:
         Returns:
             特徵向量
         """
-        return np.array([features_dict[name] for name in self.feature_names])
+        return np.array([features_dict[name] for name in self.detection_feature_names])
 
     def extract_time_series_features(self, es_client, src_ip: str, hours: int = 24) -> Dict:
         """
@@ -363,7 +431,7 @@ class FeatureEngineer:
         Returns:
             特徵名稱列表
         """
-        return self.feature_names.copy()
+        return self.detection_feature_names.copy()
 
     def describe_features(self, features_dict: Dict) -> str:
         """

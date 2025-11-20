@@ -523,11 +523,19 @@ class TrainingService:
                         'is_weekend': {'name': '週末標記', 'description': '是否為週末'},
                         'is_business_hours': {'name': '工作時間標記', 'description': '是否為工作時間（週一至五 9-18點）'},
                         'is_late_night': {'name': '深夜標記', 'description': '是否為深夜時段（22-6點）'},
+                    },
+                    'classification': {
+                        'flow_rate': {'name': '連線速率', 'description': '每秒連線數'},
+                        'byte_rate': {'name': '傳輸速率', 'description': '每秒傳輸位元組數'},
+                        'common_ports_ratio': {'name': '常用端口比例', 'description': '端口 0-1023 的比例'},
+                        'dynamic_ports_ratio': {'name': '動態端口比例', 'description': '端口 49152-65535 的比例'},
+                        'registered_ports_ratio': {'name': '註冊端口比例', 'description': '端口 1024-49151 的比例'},
                     }
                 }
                 
                 # 從 features_by_dst 讀取當前配置
                 current_features = config_data.get('features_by_dst', {})
+                current_classification_features = config_data.get('classification_features_by_dst', [])
             else:
                 # By Src 特徵列表
                 available_features = {
@@ -570,11 +578,19 @@ class TrainingService:
                         'is_weekend': {'name': '週末標記', 'description': '是否為週末'},
                         'is_business_hours': {'name': '工作時間標記', 'description': '是否為工作時間（週一至五 9-18點）'},
                         'is_late_night': {'name': '深夜標記', 'description': '是否為深夜時段（22-6點）'},
+                    },
+                    'classification': {
+                        'flow_rate': {'name': '連線速率', 'description': '每秒連線數'},
+                        'byte_rate': {'name': '傳輸速率', 'description': '每秒傳輸位元組數'},
+                        'common_ports_ratio': {'name': '常用端口比例', 'description': '端口 0-1023 的比例'},
+                        'dynamic_ports_ratio': {'name': '動態端口比例', 'description': '端口 49152-65535 的比例'},
+                        'registered_ports_ratio': {'name': '註冊端口比例', 'description': '端口 1024-49151 的比例'},
                     }
                 }
                 
                 # 從 features 讀取當前配置
                 current_features = config_data.get('features', {})
+                current_classification_features = config_data.get('classification_features', [])
 
             # 如果配置中沒有特徵設定，使用所有可用特徵作為預設值
             if not current_features:
@@ -584,6 +600,14 @@ class TrainingService:
                 }
                 # 時間序列特徵預設不啟用
                 current_features['time_series'] = []
+            
+            # 處理分類特徵
+            if not current_classification_features:
+                # 預設啟用所有分類特徵
+                current_classification_features = list(available_features['classification'].keys())
+            
+            # 將分類特徵加入 current_features (為了前端統一處理)
+            current_features['classification'] = current_classification_features
 
             # 確保所有類別都存在（向後兼容）
             if 'time_series' not in current_features:
@@ -634,10 +658,16 @@ class TrainingService:
                 config_data = yaml.safe_load(f)
 
             # 根據模式更新對應的特徵配置
+            
+            # 分離分類特徵
+            classification_features = selected_features.pop('classification', [])
+            
             if mode == 'by_dst':
                 config_data['features_by_dst'] = selected_features
+                config_data['classification_features_by_dst'] = classification_features
             else:
                 config_data['features'] = selected_features
+                config_data['classification_features'] = classification_features
 
             # 寫回檔案
             with open(self.nad_config_path, 'w', encoding='utf-8') as f:

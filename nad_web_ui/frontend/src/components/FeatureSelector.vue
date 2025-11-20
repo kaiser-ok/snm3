@@ -202,6 +202,39 @@
               </div>
             </el-checkbox>
           </el-checkbox-group>
+          </el-checkbox-group>
+        </el-card>
+
+        <!-- 分類特徵 (新增) -->
+        <el-card shadow="never" class="feature-category">
+          <template #header>
+            <div class="category-header">
+              <span>🔍 分類特徵（用於異常分類）</span>
+              <el-checkbox
+                v-model="selectAllStates.classification"
+                @change="toggleCategory('classification')"
+                :indeterminate="isIndeterminate('classification')"
+              >
+                全選
+              </el-checkbox>
+            </div>
+          </template>
+          <el-alert type="info" :closable="false" style="margin-bottom: 10px; font-size: 12px;">
+            ℹ️ 這些特徵僅用於異常分類階段，不會影響異常檢測模型的訓練
+          </el-alert>
+          <el-checkbox-group v-model="selected.classification" class="feature-list">
+            <el-checkbox
+              v-for="(info, key) in features.classification"
+              :key="key"
+              :label="key"
+              class="feature-item"
+            >
+              <div class="feature-label">
+                <span class="feature-name">{{ info.name }}</span>
+                <span class="feature-desc">{{ info.description }}</span>
+              </div>
+            </el-checkbox>
+          </el-checkbox-group>
         </el-card>
       </div>
     </div>
@@ -259,7 +292,8 @@ const features = ref({
   binary: {},
   log_transform: {},
   device_type: {},
-  time_series: {}
+  time_series: {},
+  classification: {}
 })
 
 const selected = ref({
@@ -268,7 +302,8 @@ const selected = ref({
   binary: [],
   log_transform: [],
   device_type: [],
-  time_series: []
+  time_series: [],
+  classification: []
 })
 
 const selectAllStates = ref({
@@ -277,7 +312,8 @@ const selectAllStates = ref({
   binary: false,
   log_transform: false,
   device_type: false,
-  time_series: false
+  time_series: false,
+  classification: false
 })
 
 const totalAvailable = computed(() => {
@@ -331,7 +367,10 @@ const loadFeatures = async () => {
         binary: [],
         log_transform: [],
         device_type: [],
-        time_series: []
+        log_transform: [],
+        device_type: [],
+        time_series: [],
+        classification: []
       }
 
       console.log('Features loaded:', features.value)
