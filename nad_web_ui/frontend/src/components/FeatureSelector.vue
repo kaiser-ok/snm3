@@ -202,7 +202,6 @@
               </div>
             </el-checkbox>
           </el-checkbox-group>
-          </el-checkbox-group>
         </el-card>
 
         <!-- 分類特徵 (新增) -->
