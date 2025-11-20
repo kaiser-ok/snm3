@@ -16,6 +16,7 @@ from api.detection import detection_bp
 from api.training import training_bp
 from api.analysis import analysis_bp
 from api.device_mapping import device_mapping_bp
+from api.classifier_thresholds import classifier_thresholds_bp
 
 
 def create_app(config_name='default'):
@@ -50,6 +51,7 @@ def create_app(config_name='default'):
     app.register_blueprint(training_bp)
     app.register_blueprint(analysis_bp)
     app.register_blueprint(device_mapping_bp)
+    app.register_blueprint(classifier_thresholds_bp)
 
     # 健康檢查端點
     @app.route('/api/health', methods=['GET'])

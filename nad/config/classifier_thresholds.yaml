@@ -1,0 +1,124 @@
+# Classifier 威脅分類閾值配置
+# 本文件定義各威脅類型的判斷閾值
+
+# 分類方法選擇
+classifier_method:
+  # 選項: 'rule_based' (基於規則閾值) 或 'ml_based' (Random Forest + SHAP)
+  method: 'rule_based'
+
+  # 當使用 ml_based 時的配置（預留）
+  ml_config:
+    model_path: null                    # 模型文件路徑
+    shap_explainer_path: null          # SHAP explainer 路徑
+    confidence_threshold: 0.7           # 分類置信度閾值
+
+# Src 視角威脅類型
+src_threats:
+  PORT_SCAN:
+    name: "埠掃描"
+    enabled: true
+    thresholds:
+      unique_dst_ports: 100        # 掃描埠數量 (>)
+      avg_bytes: 5000              # 平均封包大小 (<)
+      dst_port_diversity: 0.5      # 埠分散度 (>)
+
+  NETWORK_SCAN:
+    name: "網路掃描"
+    enabled: true
+    thresholds:
+      unique_dsts: 50              # 掃描主機數量 (>)
+      dst_diversity: 0.3           # 目的地分散度 (>)
+      flow_count: 1000             # 連線數 (>)
+      avg_bytes: 50000             # 平均流量 (<)
+
+  DNS_TUNNELING:
+    name: "DNS 隧道"
+    enabled: true
+    thresholds:
+      flow_count: 1000             # 連線數 (>)
+      unique_dst_ports: 2          # 使用埠數 (<=)
+      avg_bytes: 1000              # 平均封包 (<)
+      unique_dsts: 5               # 目的地數量 (<=)
+
+  DDOS:
+    name: "DDoS 攻擊"
+    enabled: true
+    thresholds:
+      flow_count: 10000            # 連線數 (>)
+      flow_rate: 30                # 連線速率 (>)
+      avg_bytes: 500               # 平均封包 (<)
+      unique_dsts: 20              # 目的地數量 (<)
+
+  DATA_EXFILTRATION:
+    name: "數據外洩"
+    enabled: true
+    thresholds:
+      total_bytes: 1000000000      # 總流量 (> 1GB)
+      byte_rate: 3000000           # 傳輸速率 (> 3MB/s)
+      unique_dsts: 5               # 目的地數量 (<=)
+      dst_diversity: 0.1           # 目的地集中度 (<)
+
+  C2_COMMUNICATION:
+    name: "C&C 通訊"
+    enabled: true
+    thresholds:
+      unique_dsts: 1               # 目的地數量 (==)
+      flow_count_min: 100          # 最小連線數 (>)
+      flow_count_max: 1000         # 最大連線數 (<)
+      avg_bytes_min: 1000          # 最小流量 (>)
+      avg_bytes_max: 100000        # 最大流量 (<)
+
+  NORMAL_HIGH_TRAFFIC:
+    name: "正常高流量"
+    enabled: true
+    thresholds:
+      total_bytes: 1000000000      # 總流量 (> 1GB)
+      unique_dsts_min: 10          # 最小目的地 (>)
+      unique_dsts_max: 100         # 最大目的地 (<)
+
+# Dst 視角威脅類型
+dst_threats:
+  DDOS_TARGET:
+    name: "DDoS 攻擊目標"
+    enabled: true
+    thresholds:
+      unique_srcs: 100             # 來源數量 (>)
+      flow_count: 1000             # 連線數 (>)
+      avg_bytes: 500               # 平均封包 (<)
+
+  SCAN_TARGET:
+    name: "掃描目標"
+    enabled: true
+    thresholds:
+      unique_src_ports: 100        # 來源埠數量 (>)
+      unique_dst_ports: 50         # 目標埠數量 (>)
+      avg_bytes: 2000              # 平均封包 (<)
+
+  DATA_SINK:
+    name: "資料外洩目標端"
+    enabled: true
+    thresholds:
+      unique_srcs: 10              # 來源數量 (>)
+      total_bytes: 100000000       # 總流量 (> 100MB)
+      avg_bytes: 10000             # 平均封包 (>)
+
+  MALWARE_DISTRIBUTION:
+    name: "惡意軟體分發"
+    enabled: true
+    thresholds:
+      unique_srcs: 5               # 來源數量 (>)
+      total_bytes: 50000000        # 總流量 (> 50MB)
+      flows_per_src: 10            # 每來源連線 (<)
+
+  POPULAR_SERVER:
+    name: "熱門服務器"
+    enabled: true
+    thresholds:
+      unique_srcs: 20              # 來源數量 (>)
+      avg_bytes_min: 500           # 最小封包 (>)
+      avg_bytes_max: 50000         # 最大封包 (<)
+
+# 全局設定
+global:
+  # 備份時間（凌晨幾點，用於判斷正常高流量）
+  backup_hours: [1, 2, 3, 4, 5]

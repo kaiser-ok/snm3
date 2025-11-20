@@ -847,6 +847,216 @@
       </div>
     </el-card>
 
+    <!-- Classifier 閾值配置 -->
+    <el-card shadow="never" class="classifier-thresholds-card" style="margin-top: 20px;">
+      <template #header>
+        <div class="card-header">
+          <span>
+            🎯 Classifier 威脅分類閾值
+            <el-tooltip
+              placement="top"
+              raw-content
+            >
+              <template #content>
+                <div style="max-width: 400px;">
+                  配置異常分類器的判斷閾值<br/><br/>
+                  <strong>分類方法：</strong><br/>
+                  • 規則閾值：基於預設條件判斷威脅類型<br/>
+                  • ML模型（未來）：Random Forest + SHAP 解釋<br/><br/>
+                  修改閾值後立即生效，無需重新訓練模型
+                </div>
+              </template>
+              <el-icon style="margin-left: 4px; cursor: help;">
+                <InfoFilled />
+              </el-icon>
+            </el-tooltip>
+          </span>
+          <div>
+            <el-button
+              size="small"
+              type="primary"
+              @click="openClassifierThresholdsDialog"
+              :icon="Setting"
+            >
+              配置閾值
+            </el-button>
+            <el-button
+              size="small"
+              @click="loadClassifierThresholds"
+              :icon="Refresh"
+              :loading="classifierThresholdsLoading"
+            >
+              重新載入
+            </el-button>
+          </div>
+        </div>
+      </template>
+
+      <el-alert
+        type="info"
+        :closable="false"
+        style="margin-bottom: 16px;"
+      >
+        <template #title>
+          當前分類方法
+        </template>
+        <strong>{{ classifierMethod === 'rule_based' ? '規則閾值' : 'ML 模型 (Random Forest + SHAP)' }}</strong>
+        <span v-if="classifierMethod === 'ml_based'" style="margin-left: 8px;">
+          （功能開發中）
+        </span>
+      </el-alert>
+
+      <div v-if="classifierThresholds" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px;">
+        <!-- Src 視角統計 -->
+        <el-card shadow="never" style="border: 1px solid #ebeef5;">
+          <template #header>
+            <strong>📤 Src 視角威脅類型</strong>
+          </template>
+          <div style="display: flex; flex-direction: column; gap: 8px;">
+            <div v-for="(config, key) in classifierThresholds.src_threats" :key="key" style="display: flex; justify-content: space-between; align-items: center;">
+              <span>{{ config.name }}</span>
+              <el-tag :type="config.enabled ? 'success' : 'info'" size="small">
+                {{ config.enabled ? '啟用' : '停用' }}
+              </el-tag>
+            </div>
+          </div>
+        </el-card>
+
+        <!-- Dst 視角統計 -->
+        <el-card shadow="never" style="border: 1px solid #ebeef5;">
+          <template #header>
+            <strong>📥 Dst 視角威脅類型</strong>
+          </template>
+          <div style="display: flex; flex-direction: column; gap: 8px;">
+            <div v-for="(config, key) in classifierThresholds.dst_threats" :key="key" style="display: flex; justify-content: space-between; align-items: center;">
+              <span>{{ config.name }}</span>
+              <el-tag :type="config.enabled ? 'success' : 'info'" size="small">
+                {{ config.enabled ? '啟用' : '停用' }}
+              </el-tag>
+            </div>
+          </div>
+        </el-card>
+      </div>
+
+      <div v-else style="text-align: center; padding: 20px; color: #909399;">
+        載入中...
+      </div>
+    </el-card>
+
+    <!-- Classifier 閾值配置對話框 -->
+    <el-dialog
+      v-model="classifierThresholdsDialogVisible"
+      title="Classifier 閾值配置"
+      width="900px"
+      :close-on-click-modal="false"
+    >
+      <div v-if="editingClassifierConfig" style="max-height: 600px; overflow-y: auto;">
+        <!-- 分類方法選擇 -->
+        <el-card shadow="never" style="margin-bottom: 16px; border: 1px solid #ebeef5;">
+          <template #header>
+            <strong>分類方法</strong>
+          </template>
+          <el-radio-group v-model="editingClassifierConfig.classifier_method.method" size="large">
+            <el-radio label="rule_based">
+              規則閾值（當前）
+              <div style="font-size: 12px; color: #909399; margin-top: 4px;">
+                基於預設條件判斷，可自訂閾值
+              </div>
+            </el-radio>
+            <el-radio label="ml_based" disabled style="margin-top: 12px;">
+              ML 模型（開發中）
+              <div style="font-size: 12px; color: #909399; margin-top: 4px;">
+                Random Forest + SHAP 解釋，需要訓練模型
+              </div>
+            </el-radio>
+          </el-radio-group>
+        </el-card>
+
+        <!-- Src 視角威脅配置 -->
+        <el-collapse v-model="activeThresholdPanels" accordion>
+          <el-collapse-item name="src" title="📤 Src 視角威脅類型閾值">
+            <div v-for="(config, key) in editingClassifierConfig.src_threats" :key="key" style="margin-bottom: 20px;">
+              <el-card shadow="never" style="border: 1px solid #ebeef5;">
+                <template #header>
+                  <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <strong>{{ config.name }} ({{ key }})</strong>
+                    <el-switch v-model="config.enabled" />
+                  </div>
+                </template>
+                <el-form label-position="top" size="small">
+                  <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px;">
+                    <el-form-item v-for="(value, param) in config.thresholds" :key="param" :label="formatParamLabel(param)">
+                      <el-input-number
+                        v-model="config.thresholds[param]"
+                        :min="0"
+                        :step="getStep(param)"
+                        :precision="getPrecision(param)"
+                        style="width: 100%;"
+                      />
+                    </el-form-item>
+                  </div>
+                </el-form>
+              </el-card>
+            </div>
+          </el-collapse-item>
+
+          <!-- Dst 視角威脅配置 -->
+          <el-collapse-item name="dst" title="📥 Dst 視角威脅類型閾值">
+            <div v-for="(config, key) in editingClassifierConfig.dst_threats" :key="key" style="margin-bottom: 20px;">
+              <el-card shadow="never" style="border: 1px solid #ebeef5;">
+                <template #header>
+                  <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <strong>{{ config.name }} ({{ key }})</strong>
+                    <el-switch v-model="config.enabled" />
+                  </div>
+                </template>
+                <el-form label-position="top" size="small">
+                  <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px;">
+                    <el-form-item v-for="(value, param) in config.thresholds" :key="param" :label="formatParamLabel(param)">
+                      <el-input-number
+                        v-model="config.thresholds[param]"
+                        :min="0"
+                        :step="getStep(param)"
+                        :precision="getPrecision(param)"
+                        style="width: 100%;"
+                      />
+                    </el-form-item>
+                  </div>
+                </el-form>
+              </el-card>
+            </div>
+          </el-collapse-item>
+
+          <!-- 全局配置 -->
+          <el-collapse-item name="global" title="⚙️ 全局配置">
+            <el-form label-position="top">
+              <el-form-item label="備份時間（判斷正常高流量）">
+                <el-checkbox-group v-model="editingClassifierConfig.global.backup_hours">
+                  <el-checkbox v-for="hour in 24" :key="hour-1" :label="hour-1">
+                    {{ (hour-1).toString().padStart(2, '0') }}:00
+                  </el-checkbox>
+                </el-checkbox-group>
+              </el-form-item>
+            </el-form>
+          </el-collapse-item>
+        </el-collapse>
+      </div>
+
+      <template #footer>
+        <span class="dialog-footer">
+          <el-button @click="classifierThresholdsDialogVisible = false">取消</el-button>
+          <el-button @click="resetClassifierThresholds">重置為預設</el-button>
+          <el-button
+            type="primary"
+            @click="saveClassifierThresholds"
+            :loading="classifierThresholdsSaving"
+          >
+            儲存配置
+          </el-button>
+        </span>
+      </template>
+    </el-dialog>
+
     <!-- 新增/編輯設備類型對話框 -->
     <el-dialog
       v-model="deviceTypeDialogVisible"
@@ -1060,7 +1270,7 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import { useTrainingStore } from '@/stores/training'
-import { VideoPlay, InfoFilled, RefreshLeft, Refresh, Plus, Edit, Delete } from '@element-plus/icons-vue'
+import { VideoPlay, InfoFilled, RefreshLeft, Refresh, Plus, Edit, Delete, Setting } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import axios from 'axios'
 import FeatureSelector from '@/components/FeatureSelector.vue'
@@ -1107,6 +1317,15 @@ const commonIcons = ['🏭', '💻', '🛠️', '🌐', '🖥️', '📱', '🔧
 
 // 預設類型（受保護）
 const protectedTypes = ['server_farm', 'station', 'iot', 'external']
+
+// Classifier 閾值配置相關
+const classifierThresholds = ref(null)
+const classifierThresholdsLoading = ref(false)
+const classifierThresholdsDialogVisible = ref(false)
+const classifierThresholdsSaving = ref(false)
+const editingClassifierConfig = ref(null)
+const activeThresholdPanels = ref('src')
+const classifierMethod = ref('rule_based')
 
 // 預設特徵標籤庫
 const predefinedCharacteristics = {
@@ -1419,6 +1638,130 @@ async function saveDeviceType() {
   }
 }
 
+// ===== Classifier 閾值配置相關方法 =====
+
+// 載入 Classifier 閾值配置
+async function loadClassifierThresholds() {
+  classifierThresholdsLoading.value = true
+  try {
+    const response = await axios.get('/api/classifier-thresholds')
+    if (response.data.status === 'success') {
+      classifierThresholds.value = response.data.config
+      classifierMethod.value = response.data.config.classifier_method?.method || 'rule_based'
+      ElMessage.success('載入成功')
+    }
+  } catch (error) {
+    ElMessage.error('載入失敗：' + (error.response?.data?.error || error.message))
+  } finally {
+    classifierThresholdsLoading.value = false
+  }
+}
+
+// 打開 Classifier 閾值配置對話框
+function openClassifierThresholdsDialog() {
+  if (!classifierThresholds.value) {
+    ElMessage.warning('請先載入配置')
+    return
+  }
+  // 深拷貝配置
+  editingClassifierConfig.value = JSON.parse(JSON.stringify(classifierThresholds.value))
+  classifierThresholdsDialogVisible.value = true
+}
+
+// 儲存 Classifier 閾值配置
+async function saveClassifierThresholds() {
+  classifierThresholdsSaving.value = true
+  try {
+    const response = await axios.put('/api/classifier-thresholds', {
+      config: editingClassifierConfig.value
+    })
+    if (response.data.status === 'success') {
+      classifierThresholds.value = JSON.parse(JSON.stringify(editingClassifierConfig.value))
+      classifierMethod.value = editingClassifierConfig.value.classifier_method?.method || 'rule_based'
+      classifierThresholdsDialogVisible.value = false
+      ElMessage.success('配置已儲存')
+    }
+  } catch (error) {
+    ElMessage.error('儲存失敗：' + (error.response?.data?.error || error.message))
+  } finally {
+    classifierThresholdsSaving.value = false
+  }
+}
+
+// 重置為預設值
+async function resetClassifierThresholds() {
+  try {
+    await ElMessageBox.confirm(
+      '確定要重置為預設值嗎？這將覆蓋目前的所有閾值設定。',
+      '警告',
+      {
+        confirmButtonText: '確定',
+        cancelButtonText: '取消',
+        type: 'warning'
+      }
+    )
+
+    classifierThresholdsSaving.value = true
+    const response = await axios.post('/api/classifier-thresholds/reset')
+    if (response.data.status === 'success') {
+      classifierThresholds.value = response.data.config
+      editingClassifierConfig.value = JSON.parse(JSON.stringify(response.data.config))
+      classifierMethod.value = response.data.config.classifier_method?.method || 'rule_based'
+      ElMessage.success('已重置為預設值')
+    }
+  } catch (error) {
+    if (error !== 'cancel') {
+      ElMessage.error('重置失敗：' + (error.response?.data?.error || error.message))
+    }
+  } finally {
+    classifierThresholdsSaving.value = false
+  }
+}
+
+// 格式化參數標籤
+function formatParamLabel(param) {
+  const labelMap = {
+    'unique_dst_ports': '掃描埠數',
+    'avg_bytes': '平均封包',
+    'dst_port_diversity': '埠分散度',
+    'unique_dsts': '目的地數',
+    'dst_diversity': '目的地分散度',
+    'flow_count': '連線數',
+    'flow_rate': '連線速率',
+    'total_bytes': '總流量',
+    'byte_rate': '傳輸速率',
+    'unique_srcs': '來源數',
+    'unique_src_ports': '來源埠數',
+    'flows_per_src': '每來源連線',
+    'flow_count_min': '最小連線數',
+    'flow_count_max': '最大連線數',
+    'avg_bytes_min': '最小封包',
+    'avg_bytes_max': '最大封包',
+    'unique_dsts_min': '最小目的地',
+    'unique_dsts_max': '最大目的地'
+  }
+  return labelMap[param] || param
+}
+
+// 取得輸入框步進值
+function getStep(param) {
+  if (param.includes('diversity') || param.includes('ratio')) {
+    return 0.01
+  } else if (param.includes('bytes') || param.includes('rate')) {
+    return 1000
+  } else {
+    return 1
+  }
+}
+
+// 取得輸入框精度
+function getPrecision(param) {
+  if (param.includes('diversity') || param.includes('ratio')) {
+    return 2
+  }
+  return 0
+}
+
 onMounted(async () => {
   // 載入兩個模式的配置
   await trainingStore.fetchConfig()
@@ -1436,6 +1779,9 @@ onMounted(async () => {
 
   // 載入設備映射配置
   await fetchDeviceMapping()
+
+  // 載入 Classifier 閾值配置
+  await loadClassifierThresholds()
 })
 
 async function handleStartTraining(mode = 'by_src') {

@@ -18,6 +18,8 @@
 import numpy as np
 from datetime import datetime
 from typing import Dict, List, Tuple
+import yaml
+import os
 
 
 # 威脅類別定義
@@ -291,8 +293,79 @@ class AnomalyClassifier:
         self.config = config
         self.threat_classes = THREAT_CLASSES
 
-        # 已知的內部網段（用於判斷內外網）
-        self.internal_networks = [
+        # 載入 classifier 閾值配置
+        self.thresholds_config = self._load_classifier_thresholds()
+
+        # 從配置中讀取 Src 和 Dst 威脅閾值
+        self.src_thresholds = self.thresholds_config.get('src_threats', {})
+        self.dst_thresholds = self.thresholds_config.get('dst_threats', {})
+        self.global_config = self.thresholds_config.get('global', {})
+
+        # 載入內部網段（從 device_mapping.yaml）
+        self.internal_networks = self._load_internal_networks()
+
+        # 已知的合法服務器（可配置）
+        self.known_servers = config.get('known_servers', []) if config else []
+
+        # 備份時間窗口（從配置讀取，預設凌晨 1-5 點）
+        backup_hours_list = self.global_config.get('backup_hours', [1, 2, 3, 4, 5])
+        self.backup_hours = range(min(backup_hours_list), max(backup_hours_list) + 1) if backup_hours_list else range(1, 6)
+
+    def _load_classifier_thresholds(self) -> Dict:
+        """載入 classifier 閾值配置"""
+        config_path = '/home/kaisermac/snm_flow/nad/config/classifier_thresholds.yaml'
+        try:
+            if os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    return yaml.safe_load(f) or {}
+            else:
+                print(f"⚠️ Classifier config not found: {config_path}, using defaults")
+                return {}
+        except Exception as e:
+            print(f"⚠️ Error loading classifier config: {e}, using defaults")
+            return {}
+
+    def _load_internal_networks(self) -> List[str]:
+        """從 device_mapping.yaml 載入內部網段"""
+        device_mapping_path = '/home/kaisermac/snm_flow/nad/config/device_mapping.yaml'
+        try:
+            if os.path.exists(device_mapping_path):
+                with open(device_mapping_path, 'r', encoding='utf-8') as f:
+                    device_config = yaml.safe_load(f) or {}
+
+                # 提取所有 network_segments
+                segments = device_config.get('network_segments', {})
+                internal_nets = []
+                for segment_name, segment_info in segments.items():
+                    subnet = segment_info.get('subnet', '')
+                    if subnet:
+                        # 將 CIDR 轉換為前綴（例如 192.168.1.0/24 -> 192.168.1.）
+                        # 簡化處理：取前3段或前1段
+                        if '/' in subnet:
+                            ip_part = subnet.split('/')[0]
+                            # 根據網段大小決定前綴
+                            parts = ip_part.split('.')
+                            if parts[0] == '10':
+                                internal_nets.append('10.')
+                            elif parts[0] == '172' and 16 <= int(parts[1]) <= 31:
+                                internal_nets.append(f'172.{parts[1]}.')
+                            elif parts[0] == '192' and parts[1] == '168':
+                                internal_nets.append(f'192.168.')
+                            else:
+                                # 其他情況使用前3段
+                                internal_nets.append('.'.join(parts[:3]) + '.')
+                        else:
+                            # 如果沒有 CIDR，直接使用
+                            internal_nets.append(subnet)
+
+                # 去重並返回
+                if internal_nets:
+                    return list(set(internal_nets))
+        except Exception as e:
+            print(f"⚠️ Error loading device mapping: {e}, using default internal networks")
+
+        # 預設內部網段
+        return [
             '192.168.',
             '10.',
             '172.16.', '172.17.', '172.18.', '172.19.',
@@ -300,12 +373,6 @@ class AnomalyClassifier:
             '172.24.', '172.25.', '172.26.', '172.27.',
             '172.28.', '172.29.', '172.30.', '172.31.'
         ]
-
-        # 已知的合法服務器（可配置）
-        self.known_servers = config.get('known_servers', []) if config else []
-
-        # 備份時間窗口（凌晨 1-5 點）
-        self.backup_hours = range(1, 6)
 
     def classify(self, features: Dict, context: Dict = None) -> Dict:
         """
@@ -433,14 +500,24 @@ class AnomalyClassifier:
         avg_bytes = features.get('avg_bytes', 0)
         dst_port_diversity = features.get('dst_port_diversity', 0)
 
+        # 從配置讀取閾值，如果沒有配置則使用預設值
+        config = self.src_thresholds.get('PORT_SCAN', {})
+        if not config.get('enabled', True):
+            return False
+
+        thresholds = config.get('thresholds', {})
+        threshold_ports = thresholds.get('unique_dst_ports', 100)
+        threshold_bytes = thresholds.get('avg_bytes', 5000)
+        threshold_diversity = thresholds.get('dst_port_diversity', 0.5)
+
         # 埠掃描特徵：
-        # 1. 掃描大量埠（> 100）
-        # 2. 小封包（< 5KB）
-        # 3. 埠高度分散（> 0.5）
+        # 1. 掃描大量埠
+        # 2. 小封包
+        # 3. 埠高度分散
         return (
-            unique_dst_ports > 100 and
-            avg_bytes < 5000 and
-            dst_port_diversity > 0.5
+            unique_dst_ports > threshold_ports and
+            avg_bytes < threshold_bytes and
+            dst_port_diversity > threshold_diversity
         )
 
     def _is_network_scan(self, features: Dict) -> bool:
@@ -450,16 +527,27 @@ class AnomalyClassifier:
         flow_count = features.get('flow_count', 0)
         avg_bytes = features.get('avg_bytes', 0)
 
+        # 從配置讀取閾值
+        config = self.src_thresholds.get('NETWORK_SCAN', {})
+        if not config.get('enabled', True):
+            return False
+
+        thresholds = config.get('thresholds', {})
+        threshold_dsts = thresholds.get('unique_dsts', 50)
+        threshold_diversity = thresholds.get('dst_diversity', 0.3)
+        threshold_flows = thresholds.get('flow_count', 1000)
+        threshold_bytes = thresholds.get('avg_bytes', 50000)
+
         # 網路掃描特徵：
-        # 1. 掃描大量主機（> 50）
-        # 2. 目的地高度分散（> 0.3）
-        # 3. 高連線數（> 1000）
+        # 1. 掃描大量主機
+        # 2. 目的地高度分散
+        # 3. 高連線數
         # 4. 小到中等流量
         return (
-            unique_dsts > 50 and
-            dst_diversity > 0.3 and
-            flow_count > 1000 and
-            avg_bytes < 50000
+            unique_dsts > threshold_dsts and
+            dst_diversity > threshold_diversity and
+            flow_count > threshold_flows and
+            avg_bytes < threshold_bytes
         )
 
     def _is_dns_tunneling(self, features: Dict, context: Dict) -> bool:
@@ -469,16 +557,27 @@ class AnomalyClassifier:
         avg_bytes = features.get('avg_bytes', 0)
         unique_dst_ports = features.get('unique_dst_ports', 0)
 
+        # 從配置讀取閾值
+        config = self.src_thresholds.get('DNS_TUNNELING', {})
+        if not config.get('enabled', True):
+            return False
+
+        thresholds = config.get('thresholds', {})
+        threshold_flows = thresholds.get('flow_count', 1000)
+        threshold_ports = thresholds.get('unique_dst_ports', 2)
+        threshold_bytes = thresholds.get('avg_bytes', 1000)
+        threshold_dsts = thresholds.get('unique_dsts', 5)
+
         # DNS 隧道特徵：
-        # 1. 大量連線（> 1000）
+        # 1. 大量連線
         # 2. 只用 DNS 埠（unique_dst_ports 接近 1）
-        # 3. 小封包（< 1KB）
-        # 4. 目的地極少（< 5）
+        # 3. 小封包
+        # 4. 目的地極少
         return (
-            flow_count > 1000 and
-            unique_dst_ports <= 2 and  # 通常只有 port 53
-            avg_bytes < 1000 and
-            unique_dsts <= 5
+            flow_count > threshold_flows and
+            unique_dst_ports <= threshold_ports and
+            avg_bytes < threshold_bytes and
+            unique_dsts <= threshold_dsts
         )
 
     def _is_ddos(self, features: Dict) -> bool:
@@ -488,14 +587,25 @@ class AnomalyClassifier:
         unique_dsts = features.get('unique_dsts', 0)
         flow_rate = features.get('flow_rate', 0)
 
+        # 從配置讀取閾值
+        config = self.src_thresholds.get('DDOS', {})
+        if not config.get('enabled', True):
+            return False
+
+        thresholds = config.get('thresholds', {})
+        threshold_flows = thresholds.get('flow_count', 10000)
+        threshold_rate = thresholds.get('flow_rate', 30)
+        threshold_bytes = thresholds.get('avg_bytes', 500)
+        threshold_dsts = thresholds.get('unique_dsts', 20)
+
         # DDoS 特徵：
-        # 1. 極高連線數（> 10000）或高連線速率（> 30/s）
-        # 2. 極小封包（< 500 bytes）- SYN Flood
-        # 3. 目的地少（< 20）
+        # 1. 極高連線數或高連線速率
+        # 2. 極小封包 - SYN Flood
+        # 3. 目的地少
         return (
-            (flow_count > 10000 or flow_rate > 30) and
-            avg_bytes < 500 and
-            unique_dsts < 20
+            (flow_count > threshold_flows or flow_rate > threshold_rate) and
+            avg_bytes < threshold_bytes and
+            unique_dsts < threshold_dsts
         )
 
     def _is_data_exfiltration(self, features: Dict, dst_ips: List[str]) -> bool:
@@ -505,18 +615,29 @@ class AnomalyClassifier:
         dst_diversity = features.get('dst_diversity', 0)
         byte_rate = features.get('byte_rate', 0)
 
+        # 從配置讀取閾值
+        config = self.src_thresholds.get('DATA_EXFILTRATION', {})
+        if not config.get('enabled', True):
+            return False
+
+        thresholds = config.get('thresholds', {})
+        threshold_bytes = thresholds.get('total_bytes', 1000000000)  # 1GB
+        threshold_rate = thresholds.get('byte_rate', 3000000)  # 3MB/s
+        threshold_dsts = thresholds.get('unique_dsts', 5)
+        threshold_diversity = thresholds.get('dst_diversity', 0.1)
+
         # 檢查是否有外部 IP
         has_external = any(not self._is_internal_ip(ip) for ip in dst_ips) if dst_ips else False
 
         # 數據外洩特徵：
-        # 1. 大流量（> 1GB）或高傳輸速率（> 3MB/s）
-        # 2. 目的地極少（< 5）
-        # 3. 目的地集中（diversity < 0.1）
+        # 1. 大流量或高傳輸速率
+        # 2. 目的地極少
+        # 3. 目的地集中
         # 4. 有外部 IP
         return (
-            (total_bytes > 1e9 or byte_rate > 3e6) and  # > 1GB or > 3MB/s
-            unique_dsts <= 5 and
-            dst_diversity < 0.1 and
+            (total_bytes > threshold_bytes or byte_rate > threshold_rate) and
+            unique_dsts <= threshold_dsts and
+            dst_diversity < threshold_diversity and
             has_external
         )
 
@@ -526,15 +647,27 @@ class AnomalyClassifier:
         unique_dsts = features.get('unique_dsts', 0)
         avg_bytes = features.get('avg_bytes', 0)
 
+        # 從配置讀取閾值
+        config = self.src_thresholds.get('C2_COMMUNICATION', {})
+        if not config.get('enabled', True):
+            return False
+
+        thresholds = config.get('thresholds', {})
+        threshold_dsts = thresholds.get('unique_dsts', 1)
+        threshold_flow_min = thresholds.get('flow_count_min', 100)
+        threshold_flow_max = thresholds.get('flow_count_max', 1000)
+        threshold_bytes_min = thresholds.get('avg_bytes_min', 1000)
+        threshold_bytes_max = thresholds.get('avg_bytes_max', 100000)
+
         # C&C 通訊特徵：
         # 1. 單一目的地
-        # 2. 中等連線數（100-1000）
-        # 3. 中等流量（1KB-100KB）
+        # 2. 中等連線數
+        # 3. 中等流量
         # 4. 週期性（需要時間序列分析，這裡簡化）
         return (
-            unique_dsts == 1 and
-            100 < flow_count < 1000 and
-            1000 < avg_bytes < 100000
+            unique_dsts == threshold_dsts and
+            threshold_flow_min < flow_count < threshold_flow_max and
+            threshold_bytes_min < avg_bytes < threshold_bytes_max
         )
 
     def _is_normal_high_traffic(self, features: Dict, dst_ips: List[str], timestamp) -> bool:
@@ -542,6 +675,16 @@ class AnomalyClassifier:
         total_bytes = features.get('total_bytes', 0)
         unique_dsts = features.get('unique_dsts', 0)
         is_likely_server = features.get('is_likely_server_response', 0)
+
+        # 從配置讀取閾值
+        config = self.src_thresholds.get('NORMAL_HIGH_TRAFFIC', {})
+        if not config.get('enabled', True):
+            return False
+
+        thresholds = config.get('thresholds', {})
+        threshold_bytes = thresholds.get('total_bytes', 1000000000)  # 1GB
+        threshold_dsts_min = thresholds.get('unique_dsts_min', 10)
+        threshold_dsts_max = thresholds.get('unique_dsts_max', 100)
 
         # 檢查是否都是內部 IP
         all_internal = all(self._is_internal_ip(ip) for ip in dst_ips) if dst_ips else False
@@ -556,9 +699,9 @@ class AnomalyClassifier:
         # 3. 或者在備份時間
         # 4. 目的地數量合理（不是單一也不是太分散）
         return (
-            total_bytes > 1e9 and
+            total_bytes > threshold_bytes and
             (all_internal or is_likely_server == 1 or is_backup_time) and
-            10 < unique_dsts < 100
+            threshold_dsts_min < unique_dsts < threshold_dsts_max
         )
 
     # ========== 置信度計算方法 ==========
@@ -876,14 +1019,24 @@ class AnomalyClassifier:
         flow_count = features.get('flow_count', 0)
         avg_bytes = features.get('avg_bytes', 0)
 
+        # 從配置讀取閾值
+        config = self.dst_thresholds.get('DDOS_TARGET', {})
+        if not config.get('enabled', True):
+            return False
+
+        thresholds = config.get('thresholds', {})
+        threshold_srcs = thresholds.get('unique_srcs', 100)
+        threshold_flows = thresholds.get('flow_count', 1000)
+        threshold_bytes = thresholds.get('avg_bytes', 500)
+
         # DDoS 特徵：
-        # 1. 大量不同來源（> 100）
-        # 2. 極高連線數（> 1000）
-        # 3. 小封包（< 500 bytes）- SYN flood 特徵
+        # 1. 大量不同來源
+        # 2. 極高連線數
+        # 3. 小封包 - SYN flood 特徵
         return (
-            unique_srcs > 100 and
-            flow_count > 1000 and
-            avg_bytes < 500
+            unique_srcs > threshold_srcs and
+            flow_count > threshold_flows and
+            avg_bytes < threshold_bytes
         )
 
     def _is_scan_target(self, features: Dict, context: Dict) -> bool:
@@ -892,14 +1045,24 @@ class AnomalyClassifier:
         unique_dst_ports = features.get('unique_dst_ports', 0)
         avg_bytes = features.get('avg_bytes', 0)
 
+        # 從配置讀取閾值
+        config = self.dst_thresholds.get('SCAN_TARGET', {})
+        if not config.get('enabled', True):
+            return False
+
+        thresholds = config.get('thresholds', {})
+        threshold_src_ports = thresholds.get('unique_src_ports', 100)
+        threshold_dst_ports = thresholds.get('unique_dst_ports', 50)
+        threshold_bytes = thresholds.get('avg_bytes', 2000)
+
         # 掃描目標特徵：
-        # 1. 大量不同來源端口（> 100）- 掃描器隨機化來源端口
-        # 2. 多個目標端口被探測（> 50）
+        # 1. 大量不同來源端口 - 掃描器隨機化來源端口
+        # 2. 多個目標端口被探測
         # 3. 小封包（探測性質）
         return (
-            unique_src_ports > 100 and
-            unique_dst_ports > 50 and
-            avg_bytes < 2000
+            unique_src_ports > threshold_src_ports and
+            unique_dst_ports > threshold_dst_ports and
+            avg_bytes < threshold_bytes
         )
 
     def _is_data_sink(self, features: Dict, context: Dict) -> bool:
@@ -909,14 +1072,24 @@ class AnomalyClassifier:
         avg_bytes = features.get('avg_bytes', 0)
         dst_ip = context.get('dst_ip', '')
 
+        # 從配置讀取閾值
+        config = self.dst_thresholds.get('DATA_SINK', {})
+        if not config.get('enabled', True):
+            return False
+
+        thresholds = config.get('thresholds', {})
+        threshold_srcs = thresholds.get('unique_srcs', 10)
+        threshold_bytes = thresholds.get('total_bytes', 100000000)  # 100MB
+        threshold_avg_bytes = thresholds.get('avg_bytes', 10000)
+
         # 資料外洩目標端特徵：
-        # 1. 多個內部來源（> 10）
-        # 2. 大流量（> 100MB）
+        # 1. 多個內部來源
+        # 2. 大流量
         # 3. 目標是外部 IP
         return (
-            unique_srcs > 10 and
-            total_bytes > 100e6 and  # > 100MB
-            avg_bytes > 10000 and  # 大封包（傳輸數據）
+            unique_srcs > threshold_srcs and
+            total_bytes > threshold_bytes and
+            avg_bytes > threshold_avg_bytes and
             not self._is_internal_ip(dst_ip)
         )
 
@@ -927,15 +1100,25 @@ class AnomalyClassifier:
         flows_per_src = features.get('flows_per_src', 0)
         dst_ip = context.get('dst_ip', '')
 
+        # 從配置讀取閾值
+        config = self.dst_thresholds.get('MALWARE_DISTRIBUTION', {})
+        if not config.get('enabled', True):
+            return False
+
+        thresholds = config.get('thresholds', {})
+        threshold_srcs = thresholds.get('unique_srcs', 5)
+        threshold_bytes = thresholds.get('total_bytes', 50000000)  # 50MB
+        threshold_flows_per_src = thresholds.get('flows_per_src', 10)
+
         # 惡意軟體分發特徵：
-        # 1. 多個內部來源下載（> 5）
-        # 2. 大流量入站（> 50MB）
-        # 3. 每個來源連線次數少（< 10）- 下載後就斷開
+        # 1. 多個內部來源下載
+        # 2. 大流量入站
+        # 3. 每個來源連線次數少 - 下載後就斷開
         # 4. 目標是外部 IP
         return (
-            unique_srcs > 5 and
-            total_bytes > 50e6 and
-            flows_per_src < 10 and
+            unique_srcs > threshold_srcs and
+            total_bytes > threshold_bytes and
+            flows_per_src < threshold_flows_per_src and
             not self._is_internal_ip(dst_ip)
         )
 
@@ -945,12 +1128,22 @@ class AnomalyClassifier:
         avg_bytes = features.get('avg_bytes', 0)
         dst_ip = context.get('dst_ip', '')
 
+        # 從配置讀取閾值
+        config = self.dst_thresholds.get('POPULAR_SERVER', {})
+        if not config.get('enabled', True):
+            return False
+
+        thresholds = config.get('thresholds', {})
+        threshold_srcs = thresholds.get('unique_srcs', 20)
+        threshold_bytes_min = thresholds.get('avg_bytes_min', 500)
+        threshold_bytes_max = thresholds.get('avg_bytes_max', 50000)
+
         # 熱門服務器特徵：
-        # 1. 大量內部來源訪問（> 20）
-        # 2. 正常封包大小（500-50000 bytes）
+        # 1. 大量內部來源訪問
+        # 2. 正常封包大小
         # 3. 目標是內部 IP
         return (
-            unique_srcs > 20 and
-            500 < avg_bytes < 50000 and
+            unique_srcs > threshold_srcs and
+            threshold_bytes_min < avg_bytes < threshold_bytes_max and
             self._is_internal_ip(dst_ip)
         )
