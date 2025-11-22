@@ -64,6 +64,9 @@ class DetectorService:
             檢測結果字典
         """
         try:
+            # 檢查 netflow_stats_3m_by_src 數據新鮮度
+            data_health = self._check_netflow_data_health()
+
             # 從 ES 讀取預存的異常檢測結果
             anomalies = self._fetch_anomalies_from_es(minutes)
             print(f"DEBUG: 從 ES 讀取到 {len(anomalies)} 條異常記錄")
@@ -106,7 +109,8 @@ class DetectorService:
                 'total_anomalies': total_anomalies,
                 'query_range': {
                     'minutes': minutes
-                }
+                },
+                'data_health': data_health
             }
 
         except Exception as e:
@@ -315,4 +319,83 @@ class DetectorService:
             return {
                 'status': 'error',
                 'error': str(e)
+            }
+
+    def _check_netflow_data_health(self) -> Dict:
+        """
+        檢查 netflow_stats_3m_by_src 索引的數據新鮮度
+
+        Returns:
+            健康狀態字典，包含 status, message, last_data_time, lag_minutes
+        """
+        from datetime import datetime, timezone, timedelta
+        from elasticsearch import Elasticsearch
+
+        try:
+            # 初始化 ES 客戶端
+            es_host = self.config.get('elasticsearch', {}).get('host', 'http://localhost:9200')
+            es = Elasticsearch([es_host], timeout=30)
+
+            # 查詢 netflow_stats_3m_by_src 索引的最新數據時間
+            query = {
+                "size": 0,
+                "aggs": {
+                    "max_time": {
+                        "max": {
+                            "field": "time_bucket"
+                        }
+                    }
+                }
+            }
+
+            response = es.search(index="netflow_stats_3m_by_src", body=query)
+
+            # 檢查是否有數據
+            max_time_value = response.get('aggregations', {}).get('max_time', {}).get('value')
+
+            if max_time_value is None:
+                return {
+                    'status': 'error',
+                    'message': 'netflow 異常：索引無資料',
+                    'last_data_time': None,
+                    'lag_minutes': None
+                }
+
+            # 轉換時間戳（毫秒）為 datetime
+            last_data_time = datetime.fromtimestamp(max_time_value / 1000, tz=timezone.utc)
+            current_time = datetime.now(timezone.utc)
+
+            # 計算延遲（分鐘）
+            lag = current_time - last_data_time
+            lag_minutes = int(lag.total_seconds() / 60)
+
+            # 判斷健康狀態（超過 30 分鐘視為異常）
+            if lag_minutes > 30:
+                return {
+                    'status': 'error',
+                    'message': f'netflow 異常：資料已延遲 {lag_minutes} 分鐘',
+                    'last_data_time': last_data_time.isoformat(),
+                    'lag_minutes': lag_minutes
+                }
+            elif lag_minutes > 15:
+                return {
+                    'status': 'warning',
+                    'message': f'netflow 警告：資料延遲 {lag_minutes} 分鐘',
+                    'last_data_time': last_data_time.isoformat(),
+                    'lag_minutes': lag_minutes
+                }
+            else:
+                return {
+                    'status': 'healthy',
+                    'message': 'netflow 數據正常',
+                    'last_data_time': last_data_time.isoformat(),
+                    'lag_minutes': lag_minutes
+                }
+
+        except Exception as e:
+            return {
+                'status': 'error',
+                'message': f'netflow 檢查失敗：{str(e)}',
+                'last_data_time': None,
+                'lag_minutes': None
             }

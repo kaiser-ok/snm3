@@ -37,7 +37,7 @@ def verify_backfill_coverage(start_date=None, end_date=None):
 
         try:
             resp = requests.post(
-                f"{ES_HOST}/netflow_stats_5m/_search",
+                f"{ES_HOST}/netflow_stats_3m_by_src/_search",
                 json=query,
                 headers={'Content-Type': 'application/json'}
             )
@@ -123,7 +123,7 @@ def verify_backfill_coverage(start_date=None, end_date=None):
         return
 
     # 2. 查詢聚合索引的統計
-    print("🔍 查詢聚合索引 (netflow_stats_5m)...")
+    print("🔍 查詢聚合索引 (netflow_stats_3m_by_src)...")
     agg_query = {
         "size": 0,
         "query": {
@@ -158,7 +158,7 @@ def verify_backfill_coverage(start_date=None, end_date=None):
 
     try:
         resp2 = requests.post(
-            f"{ES_HOST}/netflow_stats_5m/_search",
+            f"{ES_HOST}/netflow_stats_3m_by_src/_search",
             json=agg_query,
             headers={'Content-Type': 'application/json'},
             timeout=120
@@ -336,7 +336,7 @@ def verify_specific_time_bucket(time_bucket):
 
     try:
         resp = requests.post(
-            f"{ES_HOST}/netflow_stats_5m/_search",
+            f"{ES_HOST}/netflow_stats_3m_by_src/_search",
             json=agg_query,
             headers={'Content-Type': 'application/json'}
         )

@@ -193,33 +193,274 @@ class FeatureEngineer:
     def extract_classification_features(self, agg_record: Dict) -> Dict:
         """
         提取用於分類的完整特徵集（包含檢測特徵和額外特徵）
-        
+
         Args:
-            agg_record: netflow_stats_5m 的一筆記錄
-            
+            agg_record: netflow_stats_3m 的一筆記錄
+
         Returns:
             擴展的特徵字典
         """
         # 1. 獲取基礎特徵
         features = self.extract_features(agg_record)
-        
-        # 2. 計算額外分類特徵
-        
-        # 端口分析 (需要原始數據支持，這裡做近似估計或預留接口)
-        # 由於聚合數據可能沒有詳細的端口列表，我們這裡只能做有限的推斷
-        # 如果將來聚合數據包含端口列表或位圖，這裡可以更精確
-        
-        # 暫時使用默認值，等待數據源改進
-        features['common_ports_ratio'] = 0.0
-        features['dynamic_ports_ratio'] = 0.0
-        features['registered_ports_ratio'] = 0.0
-        
-        # 速率特徵 (假設窗口為 5 分鐘 = 300 秒)
-        duration = 300
+
+        # 2. 計算基於 top_ports 的端口分析特徵
+        port_features = self._extract_port_features(agg_record)
+        features.update(port_features)
+
+        # 3. 速率特徵 (窗口為 3 分鐘 = 180 秒)
+        duration = 180
         features['flow_rate'] = features['flow_count'] / duration
         features['byte_rate'] = features['total_bytes'] / duration
-        
+
         return features
+
+    def _extract_port_features(self, agg_record: Dict) -> Dict:
+        """
+        從 top_src_ports 和 top_dst_ports 提取端口特徵
+
+        Args:
+            agg_record: 聚合記錄，包含 top_src_ports 和 top_dst_ports
+
+        Returns:
+            端口特徵字典
+        """
+        port_features = {}
+
+        # 獲取 top ports 數據（flattened 格式: {"port": count}）
+        top_src_ports = agg_record.get('top_src_ports', {})
+        top_dst_ports = agg_record.get('top_dst_ports', {})
+        flow_count = max(agg_record.get('flow_count', 1), 1)  # 避免除以0
+
+        # 轉換為列表格式 [(port_int, count), ...]
+        src_ports_list = [(int(port), count) for port, count in top_src_ports.items()]
+        dst_ports_list = [(int(port), count) for port, count in top_dst_ports.items()]
+
+        # === 1. Port 集中度特徵 (P0) ===
+        port_features['top_src_port_concentration'] = self._calculate_port_concentration(
+            src_ports_list, flow_count
+        )
+        port_features['top_dst_port_concentration'] = self._calculate_port_concentration(
+            dst_ports_list, flow_count
+        )
+
+        # === 2. Well-known/Ephemeral Port 比例 (P0) ===
+        src_port_ratios = self._calculate_port_type_ratios(src_ports_list, flow_count)
+        dst_port_ratios = self._calculate_port_type_ratios(dst_ports_list, flow_count)
+
+        port_features['src_well_known_ratio'] = src_port_ratios['well_known']
+        port_features['src_ephemeral_ratio'] = src_port_ratios['ephemeral']
+        port_features['src_registered_ratio'] = src_port_ratios['registered']
+
+        port_features['dst_well_known_ratio'] = dst_port_ratios['well_known']
+        port_features['dst_ephemeral_ratio'] = dst_port_ratios['ephemeral']
+        port_features['dst_registered_ratio'] = dst_port_ratios['registered']
+
+        # 保留舊的命名以兼容現有代碼
+        port_features['common_ports_ratio'] = dst_port_ratios['well_known']
+        port_features['dynamic_ports_ratio'] = dst_port_ratios['ephemeral']
+        port_features['registered_ports_ratio'] = dst_port_ratios['registered']
+
+        # === 3. Server 角色識別特徵 (P0) ===
+        port_features['is_likely_web_server'] = self._is_web_server(src_ports_list, dst_ports_list)
+        port_features['is_likely_db_server'] = self._is_db_server(src_ports_list)
+        port_features['is_likely_dns_server'] = self._is_dns_server(src_ports_list)
+        port_features['is_likely_mail_server'] = self._is_mail_server(src_ports_list)
+
+        # === 4. Port Entropy (P1) ===
+        port_features['src_port_entropy'] = self._calculate_port_entropy(src_ports_list)
+        port_features['dst_port_entropy'] = self._calculate_port_entropy(dst_ports_list)
+
+        # === 5. Sequential Ports 檢測 (P1) ===
+        port_features['has_sequential_dst_ports'] = self._has_sequential_ports(dst_ports_list)
+
+        # === 6. High-risk Ports (P1) ===
+        port_features['high_risk_ports_count'] = self._count_high_risk_ports(
+            src_ports_list + dst_ports_list
+        )
+
+        return port_features
+
+    def _calculate_port_concentration(self, ports_list: List[tuple], flow_count: int) -> float:
+        """
+        計算最常用端口的集中度
+
+        Args:
+            ports_list: [(port, count), ...]
+            flow_count: 總連線數
+
+        Returns:
+            集中度 (0-1)，值越大表示流量越集中在少數端口
+        """
+        if not ports_list or flow_count == 0:
+            return 0.0
+
+        # 找出使用最多的端口
+        max_count = max(count for _, count in ports_list)
+        return max_count / flow_count
+
+    def _calculate_port_type_ratios(self, ports_list: List[tuple], flow_count: int) -> Dict:
+        """
+        計算不同類型端口的比例
+
+        Port 範圍:
+        - Well-known: 0-1023 (系統/知名服務)
+        - Registered: 1024-49151 (註冊服務)
+        - Ephemeral: 49152-65535 (臨時/客戶端)
+
+        Args:
+            ports_list: [(port, count), ...]
+            flow_count: 總連線數
+
+        Returns:
+            {'well_known': ratio, 'registered': ratio, 'ephemeral': ratio}
+        """
+        if not ports_list or flow_count == 0:
+            return {'well_known': 0.0, 'registered': 0.0, 'ephemeral': 0.0}
+
+        well_known_count = 0
+        registered_count = 0
+        ephemeral_count = 0
+
+        for port, count in ports_list:
+            if port <= 1023:
+                well_known_count += count
+            elif port <= 49151:
+                registered_count += count
+            else:  # 49152-65535
+                ephemeral_count += count
+
+        return {
+            'well_known': well_known_count / flow_count,
+            'registered': registered_count / flow_count,
+            'ephemeral': ephemeral_count / flow_count
+        }
+
+    def _is_web_server(self, src_ports: List[tuple], dst_ports: List[tuple]) -> int:
+        """檢測是否為 Web Server (HTTP/HTTPS)"""
+        if not src_ports:
+            return 0
+
+        web_ports = {80, 443, 8080, 8443}
+        top_src_port = src_ports[0][0] if src_ports else None
+
+        # Web Server 模式: src_port 在 80/443, dst_port 為隨機高位端口
+        if top_src_port in web_ports:
+            # 檢查 dst_ports 是否為隨機端口
+            if dst_ports:
+                avg_dst_port = sum(port * count for port, count in dst_ports) / sum(count for _, count in dst_ports)
+                if avg_dst_port > 10000:  # 客戶端隨機端口
+                    return 1
+
+        return 0
+
+    def _is_db_server(self, src_ports: List[tuple]) -> int:
+        """檢測是否為資料庫 Server"""
+        if not src_ports:
+            return 0
+
+        db_ports = {3306, 5432, 1521, 1433, 27017, 6379}  # MySQL, PostgreSQL, Oracle, MSSQL, MongoDB, Redis
+        top_src_port = src_ports[0][0] if src_ports else None
+
+        return 1 if top_src_port in db_ports else 0
+
+    def _is_dns_server(self, src_ports: List[tuple]) -> int:
+        """檢測是否為 DNS Server"""
+        if not src_ports:
+            return 0
+
+        top_src_port = src_ports[0][0] if src_ports else None
+        return 1 if top_src_port == 53 else 0
+
+    def _is_mail_server(self, src_ports: List[tuple]) -> int:
+        """檢測是否為郵件 Server"""
+        if not src_ports:
+            return 0
+
+        mail_ports = {25, 587, 465, 110, 143, 993, 995}  # SMTP, POP3, IMAP
+        top_src_port = src_ports[0][0] if src_ports else None
+
+        return 1 if top_src_port in mail_ports else 0
+
+    def _calculate_port_entropy(self, ports_list: List[tuple]) -> float:
+        """
+        計算端口分布的熵值
+
+        熵值越高表示端口分布越分散（可能是掃描）
+        熵值越低表示端口分布越集中（正常服務）
+
+        Args:
+            ports_list: [(port, count), ...]
+
+        Returns:
+            熵值 (0-log2(n))
+        """
+        if not ports_list:
+            return 0.0
+
+        total = sum(count for _, count in ports_list)
+        if total == 0:
+            return 0.0
+
+        entropy = 0.0
+        for _, count in ports_list:
+            if count > 0:
+                p = count / total
+                entropy -= p * np.log2(p)
+
+        return entropy
+
+    def _has_sequential_ports(self, ports_list: List[tuple]) -> int:
+        """
+        檢測是否存在連續端口（掃描工具特徵）
+
+        Args:
+            ports_list: [(port, count), ...]
+
+        Returns:
+            1 if 有連續端口, 0 otherwise
+        """
+        if len(ports_list) < 3:
+            return 0
+
+        ports = sorted([port for port, _ in ports_list])
+
+        # 檢查是否有連續的端口序列 (至少3個連續)
+        consecutive_count = 1
+        for i in range(1, len(ports)):
+            if ports[i] == ports[i-1] + 1:
+                consecutive_count += 1
+                if consecutive_count >= 3:
+                    return 1
+            else:
+                consecutive_count = 1
+
+        return 0
+
+    def _count_high_risk_ports(self, ports_list: List[tuple]) -> int:
+        """
+        計算高風險端口數量
+
+        高風險端口: RDP, SMB, Telnet, FTP 等常被攻擊的服務
+
+        Args:
+            ports_list: [(port, count), ...]
+
+        Returns:
+            高風險端口數量
+        """
+        high_risk_ports = {
+            21,    # FTP
+            23,    # Telnet
+            135,   # MS RPC
+            139,   # NetBIOS
+            445,   # SMB
+            3389,  # RDP
+            5900,  # VNC
+            1433,  # MSSQL (如果對外開放)
+        }
+
+        ports = {port for port, _ in ports_list}
+        return len(ports & high_risk_ports)
 
     def _extract_time_features(self, time_bucket: str) -> Dict:
         """

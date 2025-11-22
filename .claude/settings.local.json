@@ -4,7 +4,9 @@
       "Bash(mysql:*)",
       "WebSearch",
       "Bash(python3:*)",
-      "Bash(./monitor.sh:*)"
+      "Bash(./monitor.sh:*)",
+      "Bash(curl:*)",
+      "Bash(kill:*)"
     ],
     "deny": [],
     "ask": []

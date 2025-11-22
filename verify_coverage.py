@@ -176,7 +176,7 @@ def check_transform_status():
 
     try:
         resp = requests.get(
-            f"{ES_HOST}/_transform/netflow_production/_stats",
+            f"{ES_HOST}/_transform/netflow_agg_by_src/_stats",
             headers={'Content-Type': 'application/json'}
         )
         resp.raise_for_status()
@@ -186,7 +186,7 @@ def check_transform_status():
             t = stats['transforms'][0]
             state = t['state']
 
-            print(f"Transform ID: netflow_production")
+            print(f"Transform ID: netflow_agg_by_src")
             print(f"狀態: {state}")
 
             if 'stats' in t:
@@ -205,7 +205,7 @@ def check_transform_status():
                 print(f"\n⚠️  Transform 未在運行狀態 (當前: {state})")
                 print("   這可能影響數據同步")
         else:
-            print("❌ 未找到 Transform: netflow_production")
+            print("❌ 未找到 Transform: netflow_agg_by_src")
 
     except Exception as e:
         print(f"❌ 查詢 Transform 狀態失敗: {e}")

@@ -146,7 +146,7 @@ class AnalysisService:
             }
         }
 
-        response = self.es.search(index="netflow_stats_5m", body=query)
+        response = self.es.search(index="netflow_stats_3m_by_src", body=query)
         aggs = response['aggregations']
 
         # 從原始索引查詢真實的不重複目的地、埠號數量
@@ -337,7 +337,7 @@ class AnalysisService:
             }
         }
 
-        response = self.es.search(index="netflow_stats_5m", body=query)
+        response = self.es.search(index="netflow_stats_3m_by_src", body=query)
 
         timeline = []
         for bucket in response['aggregations']['timeline']['buckets']:
@@ -376,7 +376,7 @@ class AnalysisService:
         }
 
         try:
-            response = self.es.search(index="netflow_stats_5m", body=query)
+            response = self.es.search(index="netflow_stats_3m_by_src", body=query)
             aggs = response['aggregations']
 
             return {
@@ -426,7 +426,7 @@ class AnalysisService:
                 }
             }
 
-            response = self.es.search(index="netflow_stats_5m", body=query)
+            response = self.es.search(index="netflow_stats_3m_by_src", body=query)
 
             top_talkers = []
             for bucket in response['aggregations']['top_ips']['buckets']:
@@ -475,7 +475,7 @@ class AnalysisService:
         }
 
         try:
-            response = self.es.search(index="netflow_stats_5m", body=query)
+            response = self.es.search(index="netflow_stats_3m_by_src", body=query)
 
             if response['hits']['total']['value'] == 0:
                 return {'has_anomaly': False, 'behaviors': [], 'features': {}}

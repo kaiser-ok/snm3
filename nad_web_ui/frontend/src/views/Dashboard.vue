@@ -1,5 +1,16 @@
 <template>
   <div class="dashboard">
+    <!-- Netflow 數據健康警告 -->
+    <el-alert
+      v-if="dataHealthAlert.show"
+      :title="dataHealthAlert.title"
+      :type="dataHealthAlert.type"
+      :description="dataHealthAlert.description"
+      show-icon
+      :closable="false"
+      style="margin-bottom: 20px"
+    />
+
     <!-- 結果顯示 -->
     <el-card v-if="detectionStore.results" class="results-panel" shadow="never">
       <template #header>
@@ -271,6 +282,38 @@ const selectedBucket = ref(null)
 const pieChartTitle = ref('行為特徵分布（全時段）')
 let chartInstance = null
 let pieChartInstance = null
+
+// 計算數據健康狀態警告
+const dataHealthAlert = computed(() => {
+  const dataHealth = detectionStore.results?.data_health
+
+  if (!dataHealth) {
+    return { show: false }
+  }
+
+  // 根據狀態返回不同的警告配置
+  if (dataHealth.status === 'error') {
+    return {
+      show: true,
+      title: 'Netflow 數據異常',
+      type: 'error',
+      description: dataHealth.message + (dataHealth.last_data_time
+        ? ` (最後更新: ${new Date(dataHealth.last_data_time).toLocaleString('zh-TW')})`
+        : '')
+    }
+  } else if (dataHealth.status === 'warning') {
+    return {
+      show: true,
+      title: 'Netflow 數據警告',
+      type: 'warning',
+      description: dataHealth.message + (dataHealth.last_data_time
+        ? ` (最後更新: ${new Date(dataHealth.last_data_time).toLocaleString('zh-TW')})`
+        : '')
+    }
+  }
+
+  return { show: false }
+})
 
 // 計算 Top 10 異常 IP（包含來源 IP 和目的地聚合異常）
 const topAnomalousIPs = computed(() => {

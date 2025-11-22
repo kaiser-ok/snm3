@@ -15,6 +15,7 @@ from typing import List, Dict, Tuple
 from datetime import datetime
 from .bidirectional_analyzer import BidirectionalAnalyzer
 from .baseline_manager import BaselineManager
+from .bidirectional_correlation import BidirectionalCorrelationAnalyzer
 
 
 class AnomalyPostProcessor:
@@ -35,6 +36,7 @@ class AnomalyPostProcessor:
             baseline_learning_days: 基準線學習期（天數）
         """
         self.bi_analyzer = BidirectionalAnalyzer(es_host)
+        self.bidirectional_correlation = BidirectionalCorrelationAnalyzer(es_host)
 
         # 基準線管理器（可選）
         self.enable_baseline = enable_baseline
@@ -49,7 +51,8 @@ class AnomalyPostProcessor:
             'validated': 0,
             'false_positives': 0,
             'by_reason': {},
-            'baseline_deviations': 0
+            'baseline_deviations': 0,
+            'server_identified': 0  # 新增：識別為 Server 的數量
         }
 
     def validate_anomalies(self, anomalies: List[Dict], time_range: str = "now-10m") -> Dict:
@@ -73,24 +76,45 @@ class AnomalyPostProcessor:
         for anomaly in anomalies:
             self.stats['total_processed'] += 1
 
-            src_ip = anomaly.get('src_ip')
+            # 獲取 IP（根據視角不同）
+            perspective = anomaly.get('perspective', 'SRC')
+            if perspective == 'SRC':
+                ip = anomaly.get('src_ip')
+            else:  # DST
+                ip = anomaly.get('dst_ip')
+
             threat_class = anomaly.get('classification', {}).get('class', 'UNKNOWN')
 
-            # Step 1: 雙向驗證
+            # Step 1: 雙向關聯分析（檢查是否為 Server）
+            server_analysis = self._check_server_pattern(ip, time_range)
+
+            # Step 2: 原有的雙向驗證
             verification_result = self._verify_anomaly(
-                src_ip,
+                ip,
                 threat_class,
                 anomaly,
                 time_range
             )
 
-            # Step 2: 基準線驗證（如果啟用）
+            # Step 3: 基準線驗證（如果啟用）
             baseline_result = None
             if self.enable_baseline and self.baseline_manager:
-                baseline_result = self._check_baseline_deviation(src_ip, anomaly)
+                baseline_result = self._check_baseline_deviation(ip, anomaly)
 
             # 合併驗證結果
-            if verification_result['is_false_positive']:
+            # 如果雙向分析識別為 Server，降低異常嚴重性
+            if server_analysis['is_server'] and server_analysis['confidence'] > 0.6:
+                # 標記為誤報（正常 Server 行為）
+                anomaly['validation_result'] = 'FALSE_POSITIVE'
+                anomaly['false_positive_reason'] = 'LEGITIMATE_SERVER_PATTERN'
+                anomaly['server_analysis'] = server_analysis
+
+                false_positives.append(anomaly)
+                self.stats['false_positives'] += 1
+                self.stats['server_identified'] += 1
+                self.stats['by_reason']['LEGITIMATE_SERVER_PATTERN'] = self.stats['by_reason'].get('LEGITIMATE_SERVER_PATTERN', 0) + 1
+
+            elif verification_result['is_false_positive']:
                 # 標記為誤報
                 anomaly['validation_result'] = 'FALSE_POSITIVE'
                 anomaly['false_positive_reason'] = verification_result['reason']
@@ -338,6 +362,34 @@ class AnomalyPostProcessor:
                 'avg_bytes': avg_bytes
             }
         }
+
+    def _check_server_pattern(self, ip: str, time_range: str) -> Dict:
+        """
+        使用雙向關聯分析檢查 IP 是否為 Server
+
+        Args:
+            ip: IP 地址
+            time_range: 時間範圍
+
+        Returns:
+            {
+                'is_server': bool,
+                'confidence': float,
+                'reasons': list,
+                'features': dict
+            }
+        """
+        try:
+            result = self.bidirectional_correlation.analyze_server_confidence(ip, time_range)
+            return result
+        except Exception as e:
+            # 如果分析失敗，返回默認值
+            return {
+                'is_server': False,
+                'confidence': 0.0,
+                'reasons': [f'Analysis failed: {e}'],
+                'features': {}
+            }
 
     def _check_baseline_deviation(self, src_ip: str, anomaly: Dict) -> Dict:
         """

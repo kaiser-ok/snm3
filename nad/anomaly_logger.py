@@ -8,6 +8,7 @@ from elasticsearch import Elasticsearch
 from datetime import datetime, timezone
 from typing import Dict, List
 import warnings
+import pytz
 
 warnings.filterwarnings('ignore')
 
@@ -93,7 +94,7 @@ class AnomalyLogger:
 
     def get_index_name(self, timestamp: datetime = None) -> str:
         """
-        获取当天的索引名称
+        获取当天的索引名称（使用台北時區）
 
         Args:
             timestamp: 时间戳，默认为当前时间
@@ -102,7 +103,8 @@ class AnomalyLogger:
             索引名称，如 'anomaly_detection-2025.11.15'
         """
         if timestamp is None:
-            timestamp = datetime.now(timezone.utc)
+            taipei_tz = pytz.timezone('Asia/Taipei')
+            timestamp = datetime.now(taipei_tz)
 
         return f"{self.index_prefix}-{timestamp.strftime('%Y.%m.%d')}"
 
@@ -116,9 +118,11 @@ class AnomalyLogger:
             classification: 威胁分类结果（可选）
         """
         # 构建文档
+        taipei_tz = pytz.timezone('Asia/Taipei')
+        now_taipei = datetime.now(taipei_tz)
         doc = {
-            "@timestamp": datetime.now(timezone.utc).isoformat(),
-            "detection_time": datetime.now(timezone.utc).isoformat(),
+            "@timestamp": now_taipei.isoformat(),
+            "detection_time": now_taipei.isoformat(),
             "time_bucket": anomaly.get('time_bucket'),
             "src_ip": anomaly.get('src_ip'),
             "dst_ip": anomaly.get('dst_ip'),
@@ -204,9 +208,11 @@ class AnomalyLogger:
                 behaviors.append("大流量")
 
             # 构建文档
+            taipei_tz = pytz.timezone('Asia/Taipei')
+            now_taipei = datetime.now(taipei_tz)
             doc = {
-                "@timestamp": datetime.now(timezone.utc).isoformat(),
-                "detection_time": datetime.now(timezone.utc).isoformat(),
+                "@timestamp": now_taipei.isoformat(),
+                "detection_time": now_taipei.isoformat(),
                 "time_bucket": anomaly.get('time_bucket'),
                 "src_ip": anomaly.get('src_ip'),
                 "dst_ip": anomaly.get('dst_ip'),

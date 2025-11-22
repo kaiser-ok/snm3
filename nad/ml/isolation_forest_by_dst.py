@@ -188,7 +188,7 @@ class IsolationForestByDst:
 
         # 使用 scroll API 獲取大量數據
         result = self.es.search(
-            index='netflow_stats_5m_by_dst',
+            index='netflow_stats_3m_by_dst',
             body=query,
             scroll='5m',
             size=scroll_size
@@ -310,7 +310,7 @@ class IsolationForestByDst:
             "sort": [{"time_bucket": "desc"}]
         }
 
-        result = self.es.search(index='netflow_stats_5m_by_dst', body=query)
+        result = self.es.search(index='netflow_stats_3m_by_dst', body=query)
         hits = result['hits']['hits']
 
         records = [hit['_source'] for hit in hits]

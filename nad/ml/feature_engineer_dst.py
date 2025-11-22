@@ -239,6 +239,174 @@ class FeatureEngineerDst:
 
         return np.array(feature_vector, dtype=np.float64)
 
+    def extract_classification_features(self, record: Dict) -> Dict:
+        """
+        提取用於分類的完整特徵集（包含 port 特徵）
+
+        Args:
+            record: netflow_stats_3m_by_dst 記錄
+
+        Returns:
+            擴展的特徵字典
+        """
+        # 1. 獲取基礎特徵（轉換為字典）
+        feature_vector = self.extract_features(record)
+        features = {name: value for name, value in zip(self.feature_names, feature_vector)}
+
+        # 2. 添加 top_ports 特徵
+        port_features = self._extract_port_features(record)
+        features.update(port_features)
+
+        # 3. 速率特徵
+        duration = 180  # 3 分鐘窗口
+        features['flow_rate'] = features.get('flow_count', 0) / duration
+        features['byte_rate'] = features.get('total_bytes', 0) / duration
+
+        return features
+
+    def _extract_port_features(self, record: Dict) -> Dict:
+        """
+        從 top_src_ports 和 top_dst_ports 提取端口特徵（DST 視角）
+
+        Args:
+            record: 聚合記錄，包含 top_src_ports 和 top_dst_ports
+
+        Returns:
+            端口特徵字典
+        """
+        port_features = {}
+
+        # 獲取 top ports 數據
+        top_src_ports = record.get('top_src_ports', {})
+        top_dst_ports = record.get('top_dst_ports', {})
+        flow_count = max(record.get('flow_count', 1), 1)
+
+        # 轉換為列表格式
+        src_ports_list = [(int(port), count) for port, count in top_src_ports.items()]
+        dst_ports_list = [(int(port), count) for port, count in top_dst_ports.items()]
+
+        # === 1. Port 集中度特徵 ===
+        port_features['top_src_port_concentration'] = self._calculate_port_concentration(
+            src_ports_list, flow_count
+        )
+        port_features['top_dst_port_concentration'] = self._calculate_port_concentration(
+            dst_ports_list, flow_count
+        )
+
+        # === 2. Well-known/Ephemeral Port 比例 ===
+        src_port_ratios = self._calculate_port_type_ratios(src_ports_list, flow_count)
+        dst_port_ratios = self._calculate_port_type_ratios(dst_ports_list, flow_count)
+
+        port_features['src_well_known_ratio'] = src_port_ratios['well_known']
+        port_features['src_ephemeral_ratio'] = src_port_ratios['ephemeral']
+        port_features['dst_well_known_ratio'] = dst_port_ratios['well_known']
+        port_features['dst_ephemeral_ratio'] = dst_port_ratios['ephemeral']
+
+        # === 3. Server 識別（DST 視角：作為接收端）===
+        # 如果 dst_port 集中在 well-known ports，這個 IP 可能是 server
+        port_features['is_likely_web_server'] = self._is_web_server_dst(dst_ports_list)
+        port_features['is_likely_db_server'] = self._is_db_server_dst(dst_ports_list)
+        port_features['is_likely_dns_server'] = self._is_dns_server_dst(dst_ports_list)
+
+        # === 4. Port Entropy ===
+        port_features['src_port_entropy'] = self._calculate_port_entropy(src_ports_list)
+        port_features['dst_port_entropy'] = self._calculate_port_entropy(dst_ports_list)
+
+        # === 5. 攻擊模式檢測 ===
+        port_features['has_sequential_src_ports'] = self._has_sequential_ports(src_ports_list)
+        port_features['high_risk_dst_ports_count'] = self._count_high_risk_ports(dst_ports_list)
+
+        return port_features
+
+    def _calculate_port_concentration(self, ports_list: List[tuple], flow_count: int) -> float:
+        """計算端口集中度"""
+        if not ports_list or flow_count == 0:
+            return 0.0
+        max_count = max(count for _, count in ports_list)
+        return max_count / flow_count
+
+    def _calculate_port_type_ratios(self, ports_list: List[tuple], flow_count: int) -> Dict:
+        """計算不同類型端口的比例"""
+        if not ports_list or flow_count == 0:
+            return {'well_known': 0.0, 'registered': 0.0, 'ephemeral': 0.0}
+
+        well_known_count = 0
+        registered_count = 0
+        ephemeral_count = 0
+
+        for port, count in ports_list:
+            if port <= 1023:
+                well_known_count += count
+            elif port <= 49151:
+                registered_count += count
+            else:
+                ephemeral_count += count
+
+        return {
+            'well_known': well_known_count / flow_count,
+            'registered': registered_count / flow_count,
+            'ephemeral': ephemeral_count / flow_count
+        }
+
+    def _is_web_server_dst(self, dst_ports: List[tuple]) -> int:
+        """檢測是否為 Web Server（DST 視角：接收端）"""
+        if not dst_ports:
+            return 0
+        web_ports = {80, 443, 8080, 8443}
+        top_dst_port = dst_ports[0][0] if dst_ports else None
+        return 1 if top_dst_port in web_ports else 0
+
+    def _is_db_server_dst(self, dst_ports: List[tuple]) -> int:
+        """檢測是否為資料庫 Server（DST 視角）"""
+        if not dst_ports:
+            return 0
+        db_ports = {3306, 5432, 1521, 1433, 27017, 6379}
+        top_dst_port = dst_ports[0][0] if dst_ports else None
+        return 1 if top_dst_port in db_ports else 0
+
+    def _is_dns_server_dst(self, dst_ports: List[tuple]) -> int:
+        """檢測是否為 DNS Server（DST 視角）"""
+        if not dst_ports:
+            return 0
+        top_dst_port = dst_ports[0][0] if dst_ports else None
+        return 1 if top_dst_port == 53 else 0
+
+    def _calculate_port_entropy(self, ports_list: List[tuple]) -> float:
+        """計算端口熵值"""
+        if not ports_list:
+            return 0.0
+        total = sum(count for _, count in ports_list)
+        if total == 0:
+            return 0.0
+
+        entropy = 0.0
+        for _, count in ports_list:
+            if count > 0:
+                p = count / total
+                entropy -= p * np.log2(p)
+        return entropy
+
+    def _has_sequential_ports(self, ports_list: List[tuple]) -> int:
+        """檢測連續端口（掃描特徵）"""
+        if len(ports_list) < 3:
+            return 0
+        ports = sorted([port for port, _ in ports_list])
+        consecutive_count = 1
+        for i in range(1, len(ports)):
+            if ports[i] == ports[i-1] + 1:
+                consecutive_count += 1
+                if consecutive_count >= 3:
+                    return 1
+            else:
+                consecutive_count = 1
+        return 0
+
+    def _count_high_risk_ports(self, ports_list: List[tuple]) -> int:
+        """計算高風險端口數量"""
+        high_risk_ports = {21, 23, 135, 139, 445, 3389, 5900, 1433}
+        ports = {port for port, _ in ports_list}
+        return len(ports & high_risk_ports)
+
     def extract_features_batch(self, records: List[Dict]) -> np.ndarray:
         """
         批量提取特徵

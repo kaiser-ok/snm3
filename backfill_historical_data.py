@@ -4,8 +4,8 @@
 
 將過去 N 天的原始 NetFlow 資料聚合並寫入索引
 支援兩種聚合模式：
-1. by_src: 以來源 IP 聚合 -> netflow_stats_5m
-2. by_dst: 以目標 IP 聚合 -> netflow_stats_5m_by_dst
+1. by_src: 以來源 IP 聚合 -> netflow_stats_3m_by_src
+2. by_dst: 以目標 IP 聚合 -> netflow_stats_3m_by_dst
 
 模擬 Transform 的聚合邏輯，但處理歷史資料
 """
@@ -23,14 +23,14 @@ SOURCE_INDEX = "radar_flow_collector-*"
 # 聚合模式配置
 AGGREGATION_MODES = {
     'by_src': {
-        'dest_index': 'netflow_stats_5m',
+        'dest_index': 'netflow_stats_3m_by_src',
         'group_field': 'IPV4_SRC_ADDR',
         'cardinality_field': 'IPV4_DST_ADDR',
         'cardinality_name': 'unique_dsts',
         'description': '以來源 IP 聚合'
     },
     'by_dst': {
-        'dest_index': 'netflow_stats_5m_by_dst',
+        'dest_index': 'netflow_stats_3m_by_dst',
         'group_field': 'IPV4_DST_ADDR',
         'cardinality_field': 'IPV4_SRC_ADDR',
         'cardinality_name': 'unique_srcs',
@@ -135,11 +135,11 @@ class HistoricalDataBackfill:
     def _process_time_range(self, start_time, end_time, dry_run=False):
         """處理指定時間範圍的資料"""
 
-        # 計算時間範圍內有多少個5分鐘桶
-        num_5m_buckets = int((end_time - start_time).total_seconds() / 300)
+        # 計算時間範圍內有多少個3分鐘桶
+        num_3m_buckets = int((end_time - start_time).total_seconds() / 180)
 
         print(f"🔍 查詢原始資料...")
-        print(f"   預計包含 {num_5m_buckets} 個5分鐘時間桶")
+        print(f"   預計包含 {num_3m_buckets} 個3分鐘時間桶")
 
         # 構建聚合查詢（動態根據模式調整）
         group_field = self.mode_config['group_field']
@@ -161,7 +161,8 @@ class HistoricalDataBackfill:
                 "time_buckets": {
                     "date_histogram": {
                         "field": "FLOW_START_MILLISECONDS",
-                        "fixed_interval": "5m",
+                        "fixed_interval": "3m",
+                        "time_zone": "Asia/Taipei",
                         "min_doc_count": 1
                     },
                     "aggs": {
@@ -482,8 +483,8 @@ NetFlow 歷史資料回填工具
 
 參數說明:
     --mode MODE      聚合模式 (by_src 或 by_dst，預設: by_src)
-                     - by_src: 以來源 IP 聚合 -> netflow_stats_5m
-                     - by_dst: 以目標 IP 聚合 -> netflow_stats_5m_by_dst
+                     - by_src: 以來源 IP 聚合 -> netflow_stats_3m_by_src
+                     - by_dst: 以目標 IP 聚合 -> netflow_stats_3m_by_dst
     --execute        正式執行模式 (會實際寫入資料)
     --auto-confirm   自動確認執行（用於 nohup 背景執行）
     --days N         回填過去 N 天的資料 (預設: 3)
@@ -495,13 +496,13 @@ NetFlow 歷史資料回填工具
     by_src (預設):
         - 以 IPV4_SRC_ADDR 分組
         - 統計每個來源 IP 的行為
-        - 輸出到 netflow_stats_5m 索引
+        - 輸出到 netflow_stats_3m_by_src 索引
         - 用於偵測掃描、攻擊來源等
 
     by_dst:
         - 以 IPV4_DST_ADDR 分組
         - 統計每個目標 IP 的行為
-        - 輸出到 netflow_stats_5m_by_dst 索引
+        - 輸出到 netflow_stats_3m_by_dst 索引
         - 用於偵測 DDoS 目標、被掃描目標等
 
 注意事項:

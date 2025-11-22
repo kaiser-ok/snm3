@@ -164,7 +164,7 @@ class OptimizedIsolationForest:
         Returns:
             聚合記錄列表
         """
-        index = self.config.es_aggregated_index if self.config else "netflow_stats_5m"
+        index = self.config.es_aggregated_index if self.config else "netflow_stats_3m_by_src"
 
         query = {
             "size": 10000,
@@ -224,7 +224,7 @@ class OptimizedIsolationForest:
         end_time_str = end_time.strftime('%Y-%m-%dT%H:%M:%S.000Z')
 
         # 查詢最近數據
-        index = self.config.es_aggregated_index if self.config else "netflow_stats_5m"
+        index = self.config.es_aggregated_index if self.config else "netflow_stats_3m_by_src"
 
         query = {
             "size": 1000,
