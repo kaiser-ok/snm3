@@ -11,18 +11,75 @@
       style="margin-bottom: 20px"
     />
 
+    <!-- 時間範圍選擇器 -->
+    <el-card class="time-selector-card" shadow="never">
+      <div class="time-selector">
+        <div class="time-selector-label">
+          <el-icon><Calendar /></el-icon>
+          <span style="margin-left: 8px; font-weight: 600;">選擇查詢時間範圍</span>
+        </div>
+        <div class="time-selector-controls">
+          <el-radio-group v-model="timeRangeMode" @change="handleTimeRangeModeChange">
+            <el-radio-button label="quick">快速選擇</el-radio-button>
+            <el-radio-button label="custom">自訂時間</el-radio-button>
+          </el-radio-group>
+
+          <!-- 快速選擇模式 -->
+          <div v-if="timeRangeMode === 'quick'" class="quick-selector">
+            <el-select
+              v-model="selectedMinutes"
+              placeholder="選擇時間範圍"
+              style="width: 180px"
+              @change="handleQuickTimeChange"
+            >
+              <el-option label="最近 3 小時" :value="180" />
+              <el-option label="最近 6 小時" :value="360" />
+              <el-option label="最近 12 小時" :value="720" />
+              <el-option label="最近 24 小時" :value="1440" />
+              <el-option label="最近 48 小時" :value="2880" />
+              <el-option label="最近 7 天" :value="10080" />
+            </el-select>
+          </div>
+
+          <!-- 自訂時間模式 -->
+          <div v-if="timeRangeMode === 'custom'" class="custom-selector">
+            <el-date-picker
+              v-model="customTimeRange"
+              type="datetimerange"
+              range-separator="至"
+              start-placeholder="開始時間"
+              end-placeholder="結束時間"
+              format="YYYY-MM-DD HH:mm"
+              value-format="YYYY-MM-DDTHH:mm:ss.000Z"
+              :shortcuts="dateShortcuts"
+              @change="handleCustomTimeChange"
+            />
+          </div>
+
+          <el-button
+            type="primary"
+            :loading="detectionStore.loading"
+            @click="handleRunDetection"
+          >
+            <el-icon><Search /></el-icon>
+            <span style="margin-left: 5px">執行檢測</span>
+          </el-button>
+        </div>
+      </div>
+    </el-card>
+
     <!-- 結果顯示 -->
     <el-card v-if="detectionStore.results" class="results-panel" shadow="never">
       <template #header>
         <div class="card-header">
-          <span>異常IP分布圖 ({{ getTimeRangeLabel(selectedMinutes) }})</span>
+          <span>高風險IP檢測 ({{ getDisplayTimeRange() }})</span>
           <el-tag
             type="danger"
             size="large"
             style="cursor: pointer"
             @click="scrollToTopIPs"
           >
-            發現 {{ detectionStore.totalAnomalies }} 個異常IP
+            發現 {{ detectionStore.totalAnomalies }} 個高風險IP
           </el-tag>
         </div>
       </template>
@@ -48,11 +105,11 @@
         <div ref="pieChart" class="pie-chart"></div>
       </div>
 
-      <!-- Top 10 異常 IP 列表 - 只在沒有選中特定時段時顯示 -->
+      <!-- Top 10 高風險 IP 列表 - 只在沒有選中特定時段時顯示 -->
       <div v-if="!selectedBucket" ref="topIPsContainer" class="top-ips-container">
         <el-divider>
           <el-icon><TrendCharts /></el-icon>
-          <span style="margin-left: 8px">Top 10 異常 IP（依出現次數排序）</span>
+          <span style="margin-left: 8px">Top 10 高風險 IP（依出現次數排序）</span>
         </el-divider>
 
         <el-table :data="topAnomalousIPs" stripe max-height="500">
@@ -89,14 +146,14 @@
 
           <el-table-column width="140" sortable>
             <template #header>
-              <span>平均異常分數</span>
+              <span>平均風險分數</span>
               <el-tooltip
                 placement="top"
                 raw-content
               >
                 <template #content>
                   <div style="max-width: 300px;">
-                    Isolation Forest 計算的異常分數<br/>
+                    Isolation Forest 計算的風險分數<br/>
                     • 數值範圍：0.0 ~ 1.0<br/>
                     • 系統關注閥值：≥0.6
                   </div>
@@ -188,7 +245,7 @@
           <div class="bucket-header">
             <div>
               <el-icon><Clock /></el-icon>
-              <span style="margin-left: 8px">{{ formatTime(selectedBucket.time_bucket) }} - {{ selectedBucket.anomaly_count }} 個異常</span>
+              <span style="margin-left: 8px">{{ formatTime(selectedBucket.time_bucket) }} - {{ selectedBucket.anomaly_count }} 個高風險IP</span>
             </div>
             <el-button size="small" @click="clearSelectedBucket" type="primary" plain>
               <el-icon><Back /></el-icon>
@@ -210,7 +267,7 @@
             </template>
           </el-table-column>
 
-          <el-table-column label="異常分數" width="120">
+          <el-table-column label="風險分數" width="120">
             <template #default="{ row }">
               <el-tag :type="getScoreType(row.anomaly_score)">
                 {{ row.anomaly_score.toFixed(4) }}
@@ -230,7 +287,20 @@
             </template>
           </el-table-column>
 
-          <el-table-column prop="unique_dsts" label="目的地" width="100" />
+          <el-table-column prop="unique_dsts" label="目的地" width="100">
+            <template #default="{ row }">
+              {{ row.unique_dsts || '-' }}
+              <el-tooltip v-if="row.dst_response" placement="top">
+                <template #content>
+                  掃描回應統計：<br/>
+                  回應來源: {{ row.dst_response.unique_srcs }} 個<br/>
+                  回應連線: {{ row.dst_response.flow_count }}<br/>
+                  使用端口: {{ row.dst_response.unique_dst_ports }}
+                </template>
+                <el-icon style="margin-left: 4px; color: #409EFF"><InfoFilled /></el-icon>
+              </el-tooltip>
+            </template>
+          </el-table-column>
 
           <el-table-column prop="threat_class" label="威脅類型" width="150">
             <template #default="{ row }">
@@ -266,14 +336,17 @@
 import { ref, computed, onMounted, watch, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { useDetectionStore } from '@/stores/detection'
-import { Clock, TrendCharts, Back, InfoFilled, RefreshLeft } from '@element-plus/icons-vue'
+import { Clock, TrendCharts, Back, InfoFilled, RefreshLeft, Calendar, Search } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import * as echarts from 'echarts'
 
 const router = useRouter()
 const detectionStore = useDetectionStore()
 
-const selectedMinutes = ref(1440)  // 預設 24 小時（固定）
+// 時間範圍選擇
+const timeRangeMode = ref('quick')  // 'quick' 或 'custom'
+const selectedMinutes = ref(180)  // 預設 3 小時
+const customTimeRange = ref(null)  // 自訂時間範圍 [startTime, endTime]
 const chartContainer = ref(null)
 const pieChartContainer = ref(null)
 const pieChart = ref(null)
@@ -282,6 +355,67 @@ const selectedBucket = ref(null)
 const pieChartTitle = ref('行為特徵分布（全時段）')
 let chartInstance = null
 let pieChartInstance = null
+
+// 日期快捷選項
+const dateShortcuts = [
+  {
+    text: '最近 1 小時',
+    value: () => {
+      const end = new Date()
+      const start = new Date()
+      start.setTime(start.getTime() - 3600 * 1000)
+      return [start, end]
+    }
+  },
+  {
+    text: '最近 6 小時',
+    value: () => {
+      const end = new Date()
+      const start = new Date()
+      start.setTime(start.getTime() - 3600 * 1000 * 6)
+      return [start, end]
+    }
+  },
+  {
+    text: '最近 12 小時',
+    value: () => {
+      const end = new Date()
+      const start = new Date()
+      start.setTime(start.getTime() - 3600 * 1000 * 12)
+      return [start, end]
+    }
+  },
+  {
+    text: '最近 24 小時',
+    value: () => {
+      const end = new Date()
+      const start = new Date()
+      start.setTime(start.getTime() - 3600 * 1000 * 24)
+      return [start, end]
+    }
+  },
+  {
+    text: '昨天',
+    value: () => {
+      const end = new Date()
+      const start = new Date()
+      start.setTime(start.getTime() - 3600 * 1000 * 24)
+      end.setTime(end.getTime() - 3600 * 1000 * 24)
+      start.setHours(0, 0, 0, 0)
+      end.setHours(23, 59, 59, 999)
+      return [start, end]
+    }
+  },
+  {
+    text: '最近 7 天',
+    value: () => {
+      const end = new Date()
+      const start = new Date()
+      start.setTime(start.getTime() - 3600 * 1000 * 24 * 7)
+      return [start, end]
+    }
+  }
+]
 
 // 計算數據健康狀態警告
 const dataHealthAlert = computed(() => {
@@ -315,7 +449,7 @@ const dataHealthAlert = computed(() => {
   return { show: false }
 })
 
-// 計算 Top 10 異常 IP（包含來源 IP 和目的地聚合異常）
+// 計算 Top 10 高風險 IP（包含來源 IP 和目的地聚合異常）
 const topAnomalousIPs = computed(() => {
   if (!detectionStore.buckets || detectionStore.buckets.length === 0) {
     return []
@@ -417,10 +551,38 @@ watch(() => detectionStore.results, async (newResults) => {
 async function handleRunDetection() {
   try {
     selectedBucket.value = null // 清空選中的 bucket
-    await detectionStore.runDetection(selectedMinutes.value)
+
+    // 根據模式決定使用哪種參數
+    if (timeRangeMode.value === 'custom' && customTimeRange.value) {
+      // 自訂時間模式：傳遞 start_time 和 end_time
+      await detectionStore.runDetectionWithCustomTime(
+        customTimeRange.value[0],
+        customTimeRange.value[1]
+      )
+    } else {
+      // 快速選擇模式：使用 minutes 參數
+      await detectionStore.runDetection(selectedMinutes.value)
+    }
   } catch (error) {
     console.error('檢測失敗:', error)
   }
+}
+
+// 處理時間範圍模式切換
+function handleTimeRangeModeChange(mode) {
+  if (mode === 'quick') {
+    customTimeRange.value = null
+  }
+}
+
+// 處理快速時間選擇變更（不自動執行檢測）
+function handleQuickTimeChange() {
+  // 使用者需要點擊「執行檢測」按鈕
+}
+
+// 處理自訂時間範圍變更（不自動執行檢測）
+function handleCustomTimeChange() {
+  // 使用者需要點擊「執行檢測」按鈕
 }
 
 // 初始化圖表
@@ -456,7 +618,7 @@ function initChart() {
         const timeStr = xAxisData[data.dataIndex]
         // 如果同一天，只顯示時間；否則顯示完整日期時間
         const formattedTime = isSameDate ? formatTimeShort(timeStr) : formatTime(timeStr)
-        return `${formattedTime}<br/>異常IP數: ${data.value}`
+        return `${formattedTime}<br/>高風險IP數: ${data.value}`
       }
     },
     grid: {
@@ -480,7 +642,7 @@ function initChart() {
     },
     yAxis: {
       type: 'value',
-      name: '異常IP數',
+      name: '高風險IP數',
       nameTextStyle: {
         fontSize: 11
       },
@@ -491,7 +653,7 @@ function initChart() {
     },
     series: [
       {
-        name: '異常數',
+        name: '高風險IP數',
         type: 'bar',
         data: yAxisData,
         itemStyle: {
@@ -551,38 +713,103 @@ function initPieChart() {
 
   const buckets = detectionStore.buckets
 
-  // 統計所有異常記錄的行為特徵數量（一個記錄可能有多個特徵）
+  // 統計所有 IP 的行為特徵（收集每個IP的特徵，然後統計特徵總數）
+  const ipFeatureMap = new Map() // 用於追蹤每個 IP 的特徵
+
+  buckets.forEach(bucket => {
+    bucket.anomalies.forEach(anomaly => {
+      const ip = anomaly.src_ip || anomaly.dst_ip
+      if (!ip) return
+
+      // 初始化該 IP 的特徵集合
+      if (!ipFeatureMap.has(ip)) {
+        ipFeatureMap.set(ip, new Set())
+      }
+
+      // 調試：查看完整的 anomaly 物件（只輸出第一個）
+      if (!window.debugLoggedAnomaly) {
+        console.log('DEBUG - 完整的 anomaly 物件:', anomaly)
+        console.log('DEBUG - anomaly.behavior_features:', anomaly.behavior_features)
+        console.log('DEBUG - anomaly.features:', anomaly.features)
+        window.debugLoggedAnomaly = true
+      }
+
+      // 獲取行為特徵：優先使用 behavior_features，否則從 features 物件中提取
+      let behaviorFeatures = anomaly.behavior_features || ''
+
+      // 如果是陣列，轉換為字串
+      if (Array.isArray(behaviorFeatures)) {
+        behaviorFeatures = behaviorFeatures.join(', ')
+      }
+
+      // 如果 behavior_features 為空，嘗試從 features 物件中構建
+      if (!behaviorFeatures && anomaly.features) {
+        const behaviors = []
+        if (anomaly.features.is_high_connection) behaviors.push('高連線數')
+        if (anomaly.features.is_scanning_pattern) behaviors.push('掃描模式')
+        if (anomaly.features.is_small_packet) behaviors.push('小封包')
+        if (anomaly.features.is_large_flow) behaviors.push('大流量')
+        behaviorFeatures = behaviors.join(', ')
+      }
+
+      // 記錄該 IP 的特徵（使用 Set 避免重複）
+      // SRC 視角特徵
+      if (behaviorFeatures.includes('高連線數')) {
+        ipFeatureMap.get(ip).add('高連線數')
+      }
+      if (behaviorFeatures.includes('掃描模式')) {
+        ipFeatureMap.get(ip).add('掃描模式')
+      }
+      if (behaviorFeatures.includes('小封包')) {
+        ipFeatureMap.get(ip).add('小封包')
+      }
+      if (behaviorFeatures.includes('大流量')) {
+        ipFeatureMap.get(ip).add('大流量')
+      }
+      // DST 視角特徵
+      if (behaviorFeatures.includes('大量來源')) {
+        ipFeatureMap.get(ip).add('大量來源')
+      }
+      if (behaviorFeatures.includes('多端口訪問')) {
+        ipFeatureMap.get(ip).add('多端口訪問')
+      }
+      if (behaviorFeatures.includes('低頻訪問')) {
+        ipFeatureMap.get(ip).add('低頻訪問')
+      }
+    })
+  })
+
+  // 調試：輸出統計結果
+  console.log('DEBUG - Total IPs:', ipFeatureMap.size)
+  console.log('DEBUG - IP Feature Map:', Array.from(ipFeatureMap.entries()).map(([ip, features]) => ({
+    ip,
+    features: Array.from(features)
+  })))
+
+  // 統計所有 IP 的特徵總數（每個IP的每個特徵都計入）
   const featureStats = {
+    // SRC 視角特徵
     '高連線數': 0,
     '掃描模式': 0,
     '小封包': 0,
     '大流量': 0,
-    '伺服器回應': 0
+    // DST 視角特徵
+    '大量來源': 0,
+    '多端口訪問': 0,
+    '低頻訪問': 0
   }
 
-  buckets.forEach(bucket => {
-    bucket.anomalies.forEach(anomaly => {
-      // ES 中的 behavior_features 是字串格式，包含多個特徵用逗號分隔
-      const behaviorFeatures = anomaly.behavior_features || ''
-
-      // 統計各種行為特徵（字串包含檢查）
-      if (behaviorFeatures.includes('高連線數')) {
-        featureStats['高連線數']++
-      }
-      if (behaviorFeatures.includes('掃描模式')) {
-        featureStats['掃描模式']++
-      }
-      if (behaviorFeatures.includes('小封包')) {
-        featureStats['小封包']++
-      }
-      if (behaviorFeatures.includes('大流量')) {
-        featureStats['大流量']++
-      }
-      if (behaviorFeatures.includes('伺服器回應')) {
-        featureStats['伺服器回應']++
+  // 遍歷每個 IP，累計其所有特徵
+  ipFeatureMap.forEach((features) => {
+    features.forEach(feature => {
+      if (featureStats.hasOwnProperty(feature)) {
+        featureStats[feature]++
       }
     })
   })
+
+  // 計算總特徵數（用於顯示百分比）
+  const totalFeatures = Object.values(featureStats).reduce((sum, count) => sum + count, 0)
 
   // 轉換為 ECharts 餅圖數據格式，過濾掉數量為 0 的項目
   const pieData = Object.entries(featureStats)
@@ -598,7 +825,10 @@ function initPieChart() {
   const option = {
     tooltip: {
       trigger: 'item',
-      formatter: '{b}: {c} 件 ({d}%)'
+      formatter: function(params) {
+        const total = ipFeatureMap.size
+        return `${params.name}: ${params.value} 次<br/>佔 ${params.percent}% 的特徵<br/>總共 ${total} 個IP`
+      }
     },
     legend: {
       orient: 'horizontal',
@@ -620,7 +850,7 @@ function initPieChart() {
         },
         label: {
           show: true,
-          formatter: '{b}\n{c} 件',
+          formatter: '{b}\n{c} 次\n{d}%',
           fontSize: 12
         },
         emphasis: {
@@ -726,13 +956,13 @@ function getSeverityType(severity) {
   return types[severity] || 'info'
 }
 
-// 跳轉到 IP 分析頁面 - 從 Top 10 異常 IP 列表
+// 跳轉到 IP 分析頁面 - 從 Top 10 高風險 IP 列表
 function analyzeIP(ip) {
   router.push({
     name: 'IPAnalysis',
     query: {
       ip,
-      minutes: 1440  // 24 小時 = 1440 分鐘
+      minutes: 720  // 12 小時 = 720 分鐘
       // top_n 移除，讓程式自動判斷顯示筆數
     }
   })
@@ -789,37 +1019,97 @@ function getTimeRangeLabel(minutes) {
   }
 }
 
+// 獲取顯示的時間範圍（支援自訂時間）
+function getDisplayTimeRange() {
+  if (timeRangeMode.value === 'custom' && customTimeRange.value) {
+    const start = new Date(customTimeRange.value[0])
+    const end = new Date(customTimeRange.value[1])
+    return `${formatTime(start.toISOString())} 至 ${formatTime(end.toISOString())}`
+  } else {
+    return getTimeRangeLabel(selectedMinutes.value)
+  }
+}
+
 // 更新餅圖為特定時段的特徵分布
 function updatePieChartForBucket(bucket) {
   if (!pieChartInstance) return
 
-  // 統計該時段的行為特徵
+  // 統計該時段所有 IP 的行為特徵（每個 IP 每種特徵只計算一次）
+  const ipFeatureMap = new Map()
+
+  bucket.anomalies.forEach(anomaly => {
+    const ip = anomaly.src_ip || anomaly.dst_ip
+    if (!ip) return
+
+    // 初始化該 IP 的特徵集合
+    if (!ipFeatureMap.has(ip)) {
+      ipFeatureMap.set(ip, new Set())
+    }
+
+    // 獲取行為特徵：優先使用 behavior_features，否則從 features 物件中提取
+    let behaviorFeatures = anomaly.behavior_features || ''
+
+    // 如果是陣列，轉換為字串
+    if (Array.isArray(behaviorFeatures)) {
+      behaviorFeatures = behaviorFeatures.join(', ')
+    }
+
+    // 如果 behavior_features 為空，嘗試從 features 物件中構建
+    if (!behaviorFeatures && anomaly.features) {
+      const behaviors = []
+      if (anomaly.features.is_high_connection) behaviors.push('高連線數')
+      if (anomaly.features.is_scanning_pattern) behaviors.push('掃描模式')
+      if (anomaly.features.is_small_packet) behaviors.push('小封包')
+      if (anomaly.features.is_large_flow) behaviors.push('大流量')
+      behaviorFeatures = behaviors.join(', ')
+    }
+
+    // 記錄該 IP 的特徵（使用 Set 避免重複）
+    // SRC 視角特徵
+    if (behaviorFeatures.includes('高連線數')) {
+      ipFeatureMap.get(ip).add('高連線數')
+    }
+    if (behaviorFeatures.includes('掃描模式')) {
+      ipFeatureMap.get(ip).add('掃描模式')
+    }
+    if (behaviorFeatures.includes('小封包')) {
+      ipFeatureMap.get(ip).add('小封包')
+    }
+    if (behaviorFeatures.includes('大流量')) {
+      ipFeatureMap.get(ip).add('大流量')
+    }
+    // DST 視角特徵
+    if (behaviorFeatures.includes('大量來源')) {
+      ipFeatureMap.get(ip).add('大量來源')
+    }
+    if (behaviorFeatures.includes('多端口訪問')) {
+      ipFeatureMap.get(ip).add('多端口訪問')
+    }
+    if (behaviorFeatures.includes('低頻訪問')) {
+      ipFeatureMap.get(ip).add('低頻訪問')
+    }
+  })
+
+  // 統計所有 IP 的特徵總數（每個IP的每個特徵都計入）
   const featureStats = {
+    // SRC 視角特徵
     '高連線數': 0,
     '掃描模式': 0,
     '小封包': 0,
     '大流量': 0,
-    '伺服器回應': 0
+    // DST 視角特徵
+    '大量來源': 0,
+    '多端口訪問': 0,
+    '低頻訪問': 0
   }
 
-  bucket.anomalies.forEach(anomaly => {
-    const behaviorFeatures = anomaly.behavior_features || ''
-
-    if (behaviorFeatures.includes('高連線數')) {
-      featureStats['高連線數']++
-    }
-    if (behaviorFeatures.includes('掃描模式')) {
-      featureStats['掃描模式']++
-    }
-    if (behaviorFeatures.includes('小封包')) {
-      featureStats['小封包']++
-    }
-    if (behaviorFeatures.includes('大流量')) {
-      featureStats['大流量']++
-    }
-    if (behaviorFeatures.includes('伺服器回應')) {
-      featureStats['伺服器回應']++
-    }
+  // 遍歷每個 IP，累計其所有特徵
+  ipFeatureMap.forEach((features) => {
+    features.forEach(feature => {
+      if (featureStats.hasOwnProperty(feature)) {
+        featureStats[feature]++
+      }
+    })
   })
 
   // 轉換為餅圖數據
@@ -837,8 +1127,17 @@ function updatePieChartForBucket(bucket) {
 
   // 更新餅圖
   pieChartInstance.setOption({
+    tooltip: {
+      formatter: function(params) {
+        const total = ipFeatureMap.size
+        return `${params.name}: ${params.value} 次<br/>佔 ${params.percent}% 的特徵<br/>總共 ${total} 個IP`
+      }
+    },
     series: [{
-      data: pieData
+      data: pieData,
+      label: {
+        formatter: '{b}\n{c} 次\n{d}%'
+      }
     }]
   })
 }
@@ -857,6 +1156,37 @@ function resetPieChart() {
   gap: 20px;
   width: 100%;
   max-width: 100%;
+}
+
+.time-selector-card {
+  margin-bottom: 10px;
+}
+
+.time-selector {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+}
+
+.time-selector-label {
+  display: flex;
+  align-items: center;
+  font-size: 15px;
+  color: #303133;
+}
+
+.time-selector-controls {
+  display: flex;
+  align-items: center;
+  gap: 15px;
+  flex-wrap: wrap;
+}
+
+.quick-selector,
+.custom-selector {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
 .card-header {

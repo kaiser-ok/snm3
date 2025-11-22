@@ -57,6 +57,28 @@ export const useDetectionStore = defineStore('detection', () => {
     }
   }
 
+  // 方法：執行檢測（使用自訂時間範圍）
+  async function runDetectionWithCustomTime(startTime, endTime) {
+    loading.value = true
+    try {
+      // 使用自訂時間範圍執行檢測
+      const { data } = await detectionAPI.runDetectionWithCustomTime(startTime, endTime)
+
+      if (data.status === 'success') {
+        results.value = data.results
+        ElMessage.success('檢測完成！')
+        return results.value
+      } else {
+        throw new Error(data.error || '檢測失敗')
+      }
+    } catch (error) {
+      ElMessage.error('檢測失敗：' + (error.response?.data?.error || error.message))
+      throw error
+    } finally {
+      loading.value = false
+    }
+  }
+
   // 方法：輪詢檢測結果
   async function pollResults(jobId, maxAttempts = 60) {
     polling.value = true
@@ -127,6 +149,7 @@ export const useDetectionStore = defineStore('detection', () => {
     // 方法
     fetchModelStatus,
     runDetection,
+    runDetectionWithCustomTime,
     fetchStats,
     reset
   }

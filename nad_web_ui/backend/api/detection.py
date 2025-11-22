@@ -30,22 +30,43 @@ def get_status():
 
 @detection_bp.route('/api/detection/run', methods=['POST'])
 def run_detection():
-    """執行異常檢測（同步返回結果）"""
+    """執行異常檢測（同步返回結果）
+    支援兩種模式：
+    1. 使用 minutes 參數：查詢最近 N 分鐘的資料
+    2. 使用 start_time 和 end_time 參數：查詢指定時間範圍的資料
+    """
     try:
         data = request.get_json()
-        minutes = data.get('minutes', 60)
 
-        # 驗證輸入
-        if not isinstance(minutes, int) or minutes < 5 or minutes > 1440:
-            return jsonify({
-                'status': 'error',
-                'error': 'minutes must be between 5 and 1440'
-            }), 400
+        # 檢查使用哪種模式
+        start_time = data.get('start_time')
+        end_time = data.get('end_time')
+        minutes = data.get('minutes')
 
         service = init_detector_service()
 
-        # 直接執行檢測並返回結果（不需要 job_id）
-        results = service.run_detection_sync(minutes=minutes)
+        # 模式 1: 自訂時間範圍
+        if start_time and end_time:
+            # 直接傳遞 ISO 格式時間字串給服務層
+            results = service.run_detection_sync(
+                start_time=start_time,
+                end_time=end_time
+            )
+        # 模式 2: 使用分鐘數
+        elif minutes:
+            # 驗證輸入
+            if not isinstance(minutes, int) or minutes < 5 or minutes > 10080:  # 最多 7 天
+                return jsonify({
+                    'status': 'error',
+                    'error': 'minutes must be between 5 and 10080 (7 days)'
+                }), 400
+
+            results = service.run_detection_sync(minutes=minutes)
+        else:
+            return jsonify({
+                'status': 'error',
+                'error': 'Either minutes or (start_time and end_time) must be provided'
+            }), 400
 
         return jsonify({
             'status': 'success',

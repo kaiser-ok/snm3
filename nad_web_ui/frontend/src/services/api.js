@@ -49,6 +49,14 @@ export const detectionAPI = {
     return api.post('/detection/run', { minutes })
   },
 
+  // 執行異常檢測（使用自訂時間範圍）
+  runDetectionWithCustomTime(startTime, endTime) {
+    return api.post('/detection/run', {
+      start_time: startTime,
+      end_time: endTime
+    })
+  },
+
   // 獲取檢測結果
   getResults(jobId) {
     return api.get(`/detection/results/${jobId}`)

@@ -27,8 +27,8 @@ src_threats:
     enabled: true
     thresholds:
       unique_dsts: 50              # 掃描主機數量 (>)
-      dst_diversity: 0.3           # 目的地分散度 (>)
-      flow_count: 1000             # 連線數 (>)
+      dst_diversity: 0.15          # 目的地分散度 (>) - 降低以更容易識別
+      flow_count: 200              # 連線數 (>) - 從 1000 降至 200，識別較小規模掃描
       avg_bytes: 50000             # 平均流量 (<)
 
   DNS_TUNNELING:

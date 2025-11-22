@@ -117,6 +117,53 @@ class AnomalyLogger:
             device_type: 设备类型
             classification: 威胁分类结果（可选）
         """
+        # 提取行为特征
+        perspective = anomaly.get('perspective', 'SRC')
+        features = anomaly.get('features', {})
+        behaviors = []
+
+        if perspective == 'SRC':
+            # SRC 視角的行為特徵
+            if features.get('is_high_connection'):
+                behaviors.append("高連線數")
+            if features.get('is_scanning_pattern'):
+                behaviors.append("掃描模式")
+            if features.get('is_small_packet'):
+                behaviors.append("小封包")
+            if features.get('is_large_flow'):
+                behaviors.append("大流量")
+        elif perspective == 'DST':
+            # DST 視角的行為特徵（基於統計數據推斷）
+            unique_srcs = features.get('unique_srcs', 0)
+            flow_count = features.get('flow_count', 0)
+            avg_bytes = features.get('avg_bytes', 0)
+            flows_per_src = features.get('flows_per_src', 0)
+            unique_dst_ports = features.get('unique_dst_ports', 0)
+
+            # 大量來源 IP
+            if unique_srcs > 100:
+                behaviors.append("大量來源")
+
+            # 高連線數
+            if flow_count > 1000:
+                behaviors.append("高連線數")
+
+            # 小封包（可能是探測或攻擊）
+            if avg_bytes < 500:
+                behaviors.append("小封包")
+
+            # 大流量
+            if features.get('total_bytes', 0) > 10000000:  # > 10MB
+                behaviors.append("大流量")
+
+            # 掃描特徵：大量不同端口被訪問
+            if unique_dst_ports > 100:
+                behaviors.append("多端口訪問")
+
+            # 每個來源連線少（掃描回應特徵）
+            if flows_per_src > 0 and flows_per_src < 5:
+                behaviors.append("低頻訪問")
+
         # 构建文档
         taipei_tz = pytz.timezone('Asia/Taipei')
         now_taipei = datetime.now(taipei_tz)
@@ -137,6 +184,7 @@ class AnomalyLogger:
             "unique_dst_ports": anomaly.get('unique_dst_ports'),
             "total_bytes": anomaly.get('total_bytes'),
             "avg_bytes": anomaly.get('avg_bytes'),
+            "behavior_features": ', '.join(behaviors) if behaviors else None,
             "features": anomaly.get('features', {})
         }
 
@@ -197,15 +245,40 @@ class AnomalyLogger:
                 pass
 
             # 提取行为特征
+            perspective = anomaly.get('perspective', 'SRC')
+            features = anomaly.get('features', {})
             behaviors = []
-            if anomaly.get('features', {}).get('is_high_connection'):
-                behaviors.append("高連線數")
-            if anomaly.get('features', {}).get('is_scanning_pattern'):
-                behaviors.append("掃描模式")
-            if anomaly.get('features', {}).get('is_small_packet'):
-                behaviors.append("小封包")
-            if anomaly.get('features', {}).get('is_large_flow'):
-                behaviors.append("大流量")
+
+            if perspective == 'SRC':
+                # SRC 視角的行為特徵
+                if features.get('is_high_connection'):
+                    behaviors.append("高連線數")
+                if features.get('is_scanning_pattern'):
+                    behaviors.append("掃描模式")
+                if features.get('is_small_packet'):
+                    behaviors.append("小封包")
+                if features.get('is_large_flow'):
+                    behaviors.append("大流量")
+            elif perspective == 'DST':
+                # DST 視角的行為特徵（基於統計數據推斷）
+                unique_srcs = features.get('unique_srcs', 0)
+                flow_count = features.get('flow_count', 0)
+                avg_bytes = features.get('avg_bytes', 0)
+                flows_per_src = features.get('flows_per_src', 0)
+                unique_dst_ports = features.get('unique_dst_ports', 0)
+
+                if unique_srcs > 100:
+                    behaviors.append("大量來源")
+                if flow_count > 1000:
+                    behaviors.append("高連線數")
+                if avg_bytes < 500:
+                    behaviors.append("小封包")
+                if features.get('total_bytes', 0) > 10000000:
+                    behaviors.append("大流量")
+                if unique_dst_ports > 100:
+                    behaviors.append("多端口訪問")
+                if flows_per_src > 0 and flows_per_src < 5:
+                    behaviors.append("低頻訪問")
 
             # 构建文档
             taipei_tz = pytz.timezone('Asia/Taipei')

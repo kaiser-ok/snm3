@@ -53,12 +53,14 @@ class DetectorService:
                 'error': str(e)
             }
 
-    def run_detection_sync(self, minutes: int = 60) -> Dict:
+    def run_detection_sync(self, minutes: int = None, start_time: str = None, end_time: str = None) -> Dict:
         """
         同步執行異常檢測並直接返回結果
 
         Args:
-            minutes: 檢測時間範圍（分鐘）
+            minutes: 檢測時間範圍（分鐘），與 start_time/end_time 二選一
+            start_time: 開始時間（ISO 8601 格式字串）
+            end_time: 結束時間（ISO 8601 格式字串）
 
         Returns:
             檢測結果字典
@@ -68,11 +70,21 @@ class DetectorService:
             data_health = self._check_netflow_data_health()
 
             # 從 ES 讀取預存的異常檢測結果
-            anomalies = self._fetch_anomalies_from_es(minutes)
+            if start_time and end_time:
+                anomalies = self._fetch_anomalies_from_es(start_time=start_time, end_time=end_time)
+            else:
+                anomalies = self._fetch_anomalies_from_es(minutes=minutes or 60)
             print(f"DEBUG: 從 ES 讀取到 {len(anomalies)} 條異常記錄")
 
+            # 合併 SRC 和 DST 視角的異常（移除掃描回應重複記錄）
+            anomalies = self._merge_src_dst_anomalies(anomalies)
+            print(f"DEBUG: 合併後剩餘 {len(anomalies)} 條異常記錄")
+
             # 按時間 bucket 分組（填充完整時間範圍）
-            buckets = self._group_by_bucket(anomalies, minutes=minutes)
+            if start_time and end_time:
+                buckets = self._group_by_bucket(anomalies, start_time=start_time, end_time=end_time)
+            else:
+                buckets = self._group_by_bucket(anomalies, minutes=minutes or 60)
             print(f"DEBUG: 生成了 {len(buckets)} 個時間 bucket")
 
             # 計算總異常 IP 數（不重複）並補充 device_emoji
@@ -104,12 +116,18 @@ class DetectorService:
 
             total_anomalies = len(all_unique_ips)
 
+            # 構建查詢範圍資訊
+            query_range = {}
+            if minutes:
+                query_range['minutes'] = minutes
+            if start_time and end_time:
+                query_range['start_time'] = start_time
+                query_range['end_time'] = end_time
+
             return {
                 'buckets': buckets,
                 'total_anomalies': total_anomalies,
-                'query_range': {
-                    'minutes': minutes
-                },
+                'query_range': query_range,
                 'data_health': data_health
             }
 
@@ -206,12 +224,102 @@ class DetectorService:
         """
         return self.jobs.get(job_id)
 
-    def _fetch_anomalies_from_es(self, minutes: int = 60) -> List[Dict]:
+    def _merge_src_dst_anomalies(self, anomalies: List[Dict]) -> List[Dict]:
+        """
+        合併 SRC 和 DST 視角的異常記錄
+
+        邏輯：
+        1. 如果同一 IP 在同一時間段既有 SRC 異常，又有 DST 異常
+        2. 且 DST 異常是「掃描回應流量」(SCAN_RESPONSE)
+        3. 則移除 DST 異常記錄，只保留 SRC 異常
+        4. 並將 DST 的統計數據合併到 SRC 異常中
+
+        Args:
+            anomalies: 原始異常列表
+
+        Returns:
+            合併後的異常列表
+        """
+        from collections import defaultdict
+
+        # 按 (IP, time_bucket) 分組
+        grouped = defaultdict(lambda: {'src': None, 'dst': None})
+
+        for anomaly in anomalies:
+            time_bucket = anomaly.get('time_bucket')
+            perspective = anomaly.get('perspective', 'SRC')
+
+            # 判斷 IP（SRC 用 src_ip，DST 用 dst_ip）
+            if perspective == 'SRC':
+                ip = anomaly.get('src_ip')
+                if ip:
+                    key = (ip, time_bucket)
+                    grouped[key]['src'] = anomaly
+            elif perspective == 'DST':
+                ip = anomaly.get('dst_ip')
+                if ip:
+                    key = (ip, time_bucket)
+                    grouped[key]['dst'] = anomaly
+
+        # 合併邏輯
+        merged_anomalies = []
+
+        for (ip, time_bucket), records in grouped.items():
+            src_record = records['src']
+            dst_record = records['dst']
+
+            # 情況 1: 只有 SRC 異常
+            if src_record and not dst_record:
+                merged_anomalies.append(src_record)
+
+            # 情況 2: 只有 DST 異常
+            elif dst_record and not src_record:
+                merged_anomalies.append(dst_record)
+
+            # 情況 3: 同時有 SRC 和 DST 異常
+            elif src_record and dst_record:
+                src_threat_class = src_record.get('threat_class_en', '')
+                dst_threat_class = dst_record.get('threat_class_en', '')
+
+                # 合併規則 1: 掃描行為（移除掃描回應）
+                if dst_threat_class == 'Scan Response Traffic' and src_threat_class in ['Network Scanning', 'Port Scanning']:
+                    # 將 DST 的統計數據合併到 SRC
+                    src_record['dst_response'] = {
+                        'unique_srcs': dst_record.get('unique_srcs'),
+                        'flow_count': dst_record.get('flow_count'),
+                        'total_bytes': dst_record.get('total_bytes'),
+                        'unique_dst_ports': dst_record.get('unique_dst_ports')
+                    }
+                    merged_anomalies.append(src_record)
+                    print(f"DEBUG: 合併 {ip} 的掃描行為（SRC={src_threat_class}, 移除 DST 掃描回應）")
+
+                # 合併規則 2: 內網熱門服務器（正常雙向流量）
+                elif src_threat_class == 'Normal High Traffic' and dst_threat_class == 'Popular Server':
+                    # 保留 DST（服務器視角更重要）
+                    dst_record['src_traffic'] = {
+                        'flow_count': src_record.get('flow_count'),
+                        'total_bytes': src_record.get('total_bytes'),
+                        'unique_dsts': src_record.get('unique_dsts')
+                    }
+                    merged_anomalies.append(dst_record)
+                    print(f"DEBUG: 合併 {ip} 的服務器流量（保留 DST={dst_threat_class}）")
+
+                # 其他情況：不合併，保留兩筆記錄（可能是真實威脅）
+                else:
+                    merged_anomalies.append(src_record)
+                    merged_anomalies.append(dst_record)
+                    print(f"DEBUG: 保留 {ip} 的雙向異常（SRC={src_threat_class}, DST={dst_threat_class}）")
+
+        return merged_anomalies
+
+    def _fetch_anomalies_from_es(self, minutes: int = None, start_time: str = None, end_time: str = None) -> List[Dict]:
         """
         從 ES 的 anomaly_detection-* 索引讀取預存的異常檢測結果
 
         Args:
-            minutes: 查詢的時間範圍（分鐘）
+            minutes: 查詢的時間範圍（分鐘），與 start_time/end_time 二選一
+            start_time: 開始時間（ISO 8601 格式字串）
+            end_time: 結束時間（ISO 8601 格式字串）
 
         Returns:
             異常記錄列表
@@ -224,12 +332,16 @@ class DetectorService:
         es = Elasticsearch([es_host], timeout=30)
 
         # 計算時間範圍
-        end_time = datetime.now(timezone.utc)
-        start_time = end_time - timedelta(minutes=minutes)
-
-        # 轉換為 ISO 8601 格式
-        start_time_str = start_time.strftime('%Y-%m-%dT%H:%M:%S.000Z')
-        end_time_str = end_time.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+        if start_time and end_time:
+            # 使用自訂時間範圍（已經是 ISO 8601 格式）
+            start_time_str = start_time
+            end_time_str = end_time
+        else:
+            # 使用分鐘數計算時間範圍
+            end_time_dt = datetime.now(timezone.utc)
+            start_time_dt = end_time_dt - timedelta(minutes=minutes or 60)
+            start_time_str = start_time_dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+            end_time_str = end_time_dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')
 
         # 查詢 anomaly_detection-* 索引（包含 src_ip 異常和 dst_anomaly）
         query = {
@@ -256,13 +368,15 @@ class DetectorService:
             print(f"從 ES 讀取異常數據失敗: {e}")
             return []
 
-    def _group_by_bucket(self, anomalies: List[Dict], minutes: int = 60) -> List[Dict]:
+    def _group_by_bucket(self, anomalies: List[Dict], minutes: int = None, start_time: str = None, end_time: str = None) -> List[Dict]:
         """
         按 10 分鐘時間 bucket 分組異常，填充完整時間範圍
 
         Args:
             anomalies: 異常列表
-            minutes: 查詢的時間範圍（分鐘）
+            minutes: 查詢的時間範圍（分鐘），與 start_time/end_time 二選一
+            start_time: 開始時間（ISO 8601 格式字串）
+            end_time: 結束時間（ISO 8601 格式字串）
 
         Returns:
             分組後的 bucket 列表（包含空的時間段）

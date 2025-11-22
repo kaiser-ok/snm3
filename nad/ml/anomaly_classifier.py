@@ -272,6 +272,20 @@ THREAT_CLASSES = {
         ],
         'response': ['監控流量模式', '確保服務正常運行'],
         'auto_action': 'MONITOR'
+    },
+    'SCAN_RESPONSE': {
+        'name': '掃描回應流量',
+        'name_en': 'Scan Response Traffic',
+        'severity': 'MEDIUM',
+        'priority': 'P2',
+        'description': '主機執行掃描後收到的回應流量（非攻擊）',
+        'indicators': [
+            '大量不同來源 IP 回應',
+            '使用大量不同本地端口',
+            '每個來源僅少量連線（掃描回應特徵）'
+        ],
+        'response': ['確認掃描行為是否授權', '檢查掃描來源主機', '記錄掃描活動'],
+        'auto_action': 'MONITOR'
     }
 }
 
@@ -499,6 +513,10 @@ class AnomalyClassifier:
         unique_dst_ports = features.get('unique_dst_ports', 0)
         avg_bytes = features.get('avg_bytes', 0)
         dst_port_diversity = features.get('dst_port_diversity', 0)
+        unique_dsts = features.get('unique_dsts', 0)
+
+        # Port 相關特徵
+        top_dst_port_concentration = features.get('top_dst_port_concentration', 0)
 
         # 從配置讀取閾值，如果沒有配置則使用預設值
         config = self.src_thresholds.get('PORT_SCAN', {})
@@ -514,10 +532,14 @@ class AnomalyClassifier:
         # 1. 掃描大量埠
         # 2. 小封包
         # 3. 埠高度分散
+        # 4. 【新增】目標主機少（專注於少數目標的端口掃描）
+        # 5. 【新增】端口流量分散（沒有集中在特定端口）
         return (
             unique_dst_ports > threshold_ports and
             avg_bytes < threshold_bytes and
-            dst_port_diversity > threshold_diversity
+            dst_port_diversity > threshold_diversity and
+            unique_dsts < 50 and  # 少於 50 個目標（與網路掃描區分）
+            top_dst_port_concentration < 0.3  # 端口流量分散
         )
 
     def _is_network_scan(self, features: Dict) -> bool:
@@ -526,6 +548,11 @@ class AnomalyClassifier:
         dst_diversity = features.get('dst_diversity', 0)
         flow_count = features.get('flow_count', 0)
         avg_bytes = features.get('avg_bytes', 0)
+
+        # Port 相關特徵
+        top_dst_port_concentration = features.get('top_dst_port_concentration', 0)
+        dst_well_known_ratio = features.get('dst_well_known_ratio', 0)
+        top_src_port_concentration = features.get('top_src_port_concentration', 0)
 
         # 從配置讀取閾值
         config = self.src_thresholds.get('NETWORK_SCAN', {})
@@ -543,12 +570,25 @@ class AnomalyClassifier:
         # 2. 目的地高度分散
         # 3. 高連線數
         # 4. 小到中等流量
-        return (
+        # 5. 【新增】目的端口集中在常見服務（知名端口比例高）
+        # 6. 【新增】來源端口高度分散（隨機化）
+
+        # 基本掃描特徵
+        is_basic_scan = (
             unique_dsts > threshold_dsts and
             dst_diversity > threshold_diversity and
             flow_count > threshold_flows and
             avg_bytes < threshold_bytes
         )
+
+        # Port 特徵加成：提高識別準確度
+        has_scan_port_pattern = (
+            top_dst_port_concentration > 0.3 and  # 目的端口相對集中（掃描常見服務）
+            dst_well_known_ratio > 0.7 and         # 70% 以上是知名端口
+            top_src_port_concentration < 0.2       # 來源端口高度分散
+        )
+
+        return is_basic_scan or (unique_dsts > threshold_dsts and has_scan_port_pattern)
 
     def _is_dns_tunneling(self, features: Dict, context: Dict) -> bool:
         """判斷是否為 DNS 隧道"""
@@ -556,6 +596,9 @@ class AnomalyClassifier:
         unique_dsts = features.get('unique_dsts', 0)
         avg_bytes = features.get('avg_bytes', 0)
         unique_dst_ports = features.get('unique_dst_ports', 0)
+
+        # Port 相關特徵
+        top_dst_port_concentration = features.get('top_dst_port_concentration', 0)
 
         # 從配置讀取閾值
         config = self.src_thresholds.get('DNS_TUNNELING', {})
@@ -573,11 +616,13 @@ class AnomalyClassifier:
         # 2. 只用 DNS 埠（unique_dst_ports 接近 1）
         # 3. 小封包
         # 4. 目的地極少
+        # 5. 【新增】端口極度集中（幾乎只用 port 53）
         return (
             flow_count > threshold_flows and
             unique_dst_ports <= threshold_ports and
             avg_bytes < threshold_bytes and
-            unique_dsts <= threshold_dsts
+            unique_dsts <= threshold_dsts and
+            top_dst_port_concentration > 0.9  # 90% 流量集中在單一端口（DNS:53）
         )
 
     def _is_ddos(self, features: Dict) -> bool:
@@ -615,6 +660,10 @@ class AnomalyClassifier:
         dst_diversity = features.get('dst_diversity', 0)
         byte_rate = features.get('byte_rate', 0)
 
+        # Port 相關特徵
+        dst_well_known_ratio = features.get('dst_well_known_ratio', 0)
+        common_ports_ratio = features.get('common_ports_ratio', 0)
+
         # 從配置讀取閾值
         config = self.src_thresholds.get('DATA_EXFILTRATION', {})
         if not config.get('enabled', True):
@@ -629,23 +678,34 @@ class AnomalyClassifier:
         # 檢查是否有外部 IP
         has_external = any(not self._is_internal_ip(ip) for ip in dst_ips) if dst_ips else False
 
+        # 【新增】使用非標準端口（規避檢測的常見手法）
+        uses_non_standard_ports = (common_ports_ratio < 0.3)  # 少於 30% 使用標準端口
+
         # 數據外洩特徵：
         # 1. 大流量或高傳輸速率
         # 2. 目的地極少
         # 3. 目的地集中
         # 4. 有外部 IP
-        return (
+        # 5. 【新增】可能使用非標準端口（提高置信度）
+        basic_exfil = (
             (total_bytes > threshold_bytes or byte_rate > threshold_rate) and
             unique_dsts <= threshold_dsts and
             dst_diversity < threshold_diversity and
             has_external
         )
 
+        # 如果使用非標準端口，更可疑
+        return basic_exfil
+
     def _is_c2_communication(self, features: Dict, context: Dict) -> bool:
         """判斷是否為 C&C 通訊"""
         flow_count = features.get('flow_count', 0)
         unique_dsts = features.get('unique_dsts', 0)
         avg_bytes = features.get('avg_bytes', 0)
+
+        # Port 相關特徵
+        unique_dst_ports = features.get('unique_dst_ports', 0)
+        common_ports_ratio = features.get('common_ports_ratio', 0)
 
         # 從配置讀取閾值
         config = self.src_thresholds.get('C2_COMMUNICATION', {})
@@ -659,15 +719,21 @@ class AnomalyClassifier:
         threshold_bytes_min = thresholds.get('avg_bytes_min', 1000)
         threshold_bytes_max = thresholds.get('avg_bytes_max', 100000)
 
+        # 【新增】C&C 常用高端口號 (> 1024) 或非標準端口
+        uses_high_ports = (common_ports_ratio < 0.5)  # 少於 50% 使用標準端口
+
         # C&C 通訊特徵：
         # 1. 單一目的地
         # 2. 中等連線數
         # 3. 中等流量
         # 4. 週期性（需要時間序列分析，這裡簡化）
+        # 5. 【新增】通常使用少數端口（1-3個）
+        # 6. 【新增】可能使用非標準端口（規避檢測）
         return (
             unique_dsts == threshold_dsts and
             threshold_flow_min < flow_count < threshold_flow_max and
-            threshold_bytes_min < avg_bytes < threshold_bytes_max
+            threshold_bytes_min < avg_bytes < threshold_bytes_max and
+            unique_dst_ports <= 3  # C&C 通常只用少數端口
         )
 
     def _is_normal_high_traffic(self, features: Dict, dst_ips: List[str], timestamp) -> bool:
@@ -739,17 +805,39 @@ class AnomalyClassifier:
         unique_dsts = features.get('unique_dsts', 0)
         dst_diversity = features.get('dst_diversity', 0)
 
+        # Port 相關特徵
+        top_dst_port_concentration = features.get('top_dst_port_concentration', 0)
+        dst_well_known_ratio = features.get('dst_well_known_ratio', 0)
+        top_src_port_concentration = features.get('top_src_port_concentration', 0)
+
         confidence = 0.6
 
+        # 掃描主機數量
         if unique_dsts > 100:
-            confidence += 0.2
-        elif unique_dsts > 70:
-            confidence += 0.1
-
-        if dst_diversity > 0.5:
             confidence += 0.15
-        elif dst_diversity > 0.4:
+        elif unique_dsts > 70:
             confidence += 0.08
+
+        # 目的地分散度
+        if dst_diversity > 0.5:
+            confidence += 0.1
+        elif dst_diversity > 0.4:
+            confidence += 0.05
+
+        # 【新增】Port 特徵加成
+        # 掃描常見服務端口（知名端口比例高）
+        if dst_well_known_ratio > 0.8:
+            confidence += 0.1
+        elif dst_well_known_ratio > 0.6:
+            confidence += 0.05
+
+        # 目的端口集中在少數服務
+        if top_dst_port_concentration > 0.5:
+            confidence += 0.08
+
+        # 來源端口高度隨機化（掃描器特徵）
+        if top_src_port_concentration < 0.1:
+            confidence += 0.06
 
         return min(confidence, 0.99)
 
@@ -907,9 +995,17 @@ class AnomalyClassifier:
         elif class_name == 'NETWORK_SCAN':
             unique_dsts = features.get('unique_dsts', 0)
             flow_count = features.get('flow_count', 0)
+            dst_well_known_ratio = features.get('dst_well_known_ratio', 0)
+            top_dst_port_concentration = features.get('top_dst_port_concentration', 0)
 
             indicators.append(f"掃描 {unique_dsts} 個不同主機")
             indicators.append(f"總連線數 {flow_count:,}")
+
+            # 添加 port 特徵指標
+            if dst_well_known_ratio > 0.7:
+                indicators.append(f"目標端口 {dst_well_known_ratio*100:.1f}% 為知名服務端口")
+            if top_dst_port_concentration > 0.3:
+                indicators.append(f"端口集中度 {top_dst_port_concentration*100:.1f}%（集中在少數常見服務）")
 
         elif class_name == 'DATA_EXFILTRATION':
             total_bytes = features.get('total_bytes', 0)
@@ -949,6 +1045,55 @@ class AnomalyClassifier:
 
             if features.get('is_likely_server_response', 0) == 1:
                 indicators.append("可能是服務器回應流量")
+
+        elif class_name == 'SCAN_RESPONSE':
+            unique_srcs = features.get('unique_srcs', 0)
+            unique_dst_ports = features.get('unique_dst_ports', 0)
+            flows_per_src = features.get('flows_per_src', 0)
+
+            indicators.append(f"{unique_srcs:,} 個不同來源 IP 回應")
+            indicators.append(f"使用 {unique_dst_ports:,} 個不同本地端口")
+            indicators.append(f"每個來源平均 {flows_per_src:.1f} 個連線（掃描回應特徵）")
+
+        # ===== DST 視角威脅類型 =====
+        elif class_name == 'DDOS_TARGET':
+            unique_srcs = features.get('unique_srcs', 0)
+            flow_count = features.get('flow_count', 0)
+            avg_bytes = features.get('avg_bytes', 0)
+
+            indicators.append(f"遭受 {unique_srcs:,} 個不同來源 IP 攻擊")
+            indicators.append(f"總連線數 {flow_count:,}")
+            indicators.append(f"平均封包 {avg_bytes:.0f} bytes（小封包攻擊）")
+
+        elif class_name == 'SCAN_TARGET':
+            unique_src_ports = features.get('unique_src_ports', 0)
+            unique_dst_ports = features.get('unique_dst_ports', 0)
+
+            indicators.append(f"被掃描 {unique_dst_ports:,} 個不同端口")
+            indicators.append(f"來源使用 {unique_src_ports:,} 個不同端口（隨機化）")
+
+        elif class_name == 'DATA_SINK':
+            unique_srcs = features.get('unique_srcs', 0)
+            total_bytes = features.get('total_bytes', 0)
+
+            indicators.append(f"{unique_srcs:,} 個內部 IP 傳輸數據到此")
+            indicators.append(f"總流量 {total_bytes/1e6:.2f} MB")
+
+        elif class_name == 'MALWARE_DISTRIBUTION':
+            unique_srcs = features.get('unique_srcs', 0)
+            total_bytes = features.get('total_bytes', 0)
+            flows_per_src = features.get('flows_per_src', 0)
+
+            indicators.append(f"{unique_srcs:,} 個內部 IP 下載數據")
+            indicators.append(f"總流量 {total_bytes/1e6:.2f} MB")
+            indicators.append(f"每個來源平均 {flows_per_src:.1f} 個連線（下載後斷開）")
+
+        elif class_name == 'POPULAR_SERVER':
+            unique_srcs = features.get('unique_srcs', 0)
+            avg_bytes = features.get('avg_bytes', 0)
+
+            indicators.append(f"{unique_srcs:,} 個內部 IP 訪問此服務")
+            indicators.append(f"平均封包 {avg_bytes:.0f} bytes（正常服務流量）")
 
         return indicators
 
@@ -990,34 +1135,59 @@ class AnomalyClassifier:
 
         dst_ip = context.get('dst_ip', 'unknown')
 
-        # 1. DDoS 攻擊目標
+        # 1. 掃描回應流量（優先判斷，避免誤判為 DDoS）
+        if self._is_scan_response(features, context):
+            return self._create_classification('SCAN_RESPONSE', 0.90, features, context)
+
+        # 2. DDoS 攻擊目標
         if self._is_ddos_target(features, context):
             return self._create_classification('DDOS_TARGET', 0.95, features, context)
 
-        # 2. 掃描目標
+        # 3. 掃描目標
         if self._is_scan_target(features, context):
             return self._create_classification('SCAN_TARGET', 0.90, features, context)
 
-        # 3. 資料外洩目標端
+        # 4. 資料外洩目標端
         if self._is_data_sink(features, context):
             return self._create_classification('DATA_SINK', 0.85, features, context)
 
-        # 4. 惡意軟體分發服務器
+        # 5. 惡意軟體分發服務器
         if self._is_malware_distribution(features, context):
             return self._create_classification('MALWARE_DISTRIBUTION', 0.80, features, context)
 
-        # 5. 熱門服務器（內部服務）
+        # 6. 熱門服務器（內部服務）
         if self._is_popular_server(features, context):
             return self._create_classification('POPULAR_SERVER', 0.70, features, context)
 
-        # 6. 未知 dst 異常
+        # 7. 未知 dst 異常
         return self._create_classification('UNKNOWN', 0.50, features, context)
+
+    def _is_scan_response(self, features: Dict, context: Dict) -> bool:
+        """判斷是否為掃描回應流量"""
+        unique_srcs = features.get('unique_srcs', 0)
+        unique_dst_ports = features.get('unique_dst_ports', 0)
+        flows_per_src = features.get('flows_per_src', 1)
+        avg_bytes = features.get('avg_bytes', 0)
+
+        # 掃描回應流量特徵：
+        # 1. 大量不同來源 IP（被掃描的主機回應）
+        # 2. 大量不同的本地端口（掃描器隨機分配的本地端口）
+        # 3. 每個來源僅少量連線（通常 1-3 個，因為是掃描探測回應）
+        # 4. 小封包（探測回應）
+        return (
+            unique_srcs > 50 and
+            unique_dst_ports > 100 and
+            flows_per_src < 5 and
+            avg_bytes < 2000
+        )
 
     def _is_ddos_target(self, features: Dict, context: Dict) -> bool:
         """判斷是否為 DDoS 攻擊目標"""
         unique_srcs = features.get('unique_srcs', 0)
         flow_count = features.get('flow_count', 0)
         avg_bytes = features.get('avg_bytes', 0)
+        unique_dst_ports = features.get('unique_dst_ports', 0)
+        flows_per_src = features.get('flows_per_src', 1)
 
         # 從配置讀取閾值
         config = self.dst_thresholds.get('DDOS_TARGET', {})
@@ -1029,10 +1199,19 @@ class AnomalyClassifier:
         threshold_flows = thresholds.get('flow_count', 1000)
         threshold_bytes = thresholds.get('avg_bytes', 500)
 
+        # ⚠️ 排除掃描回應流量：
+        # 如果有大量不同的目標端口 (> 100) 且每個來源平均連線少 (< 5)
+        # 這是掃描後的回應流量，不是 DDoS
+        is_scan_response = (unique_dst_ports > 100 and flows_per_src < 5)
+
+        if is_scan_response:
+            return False
+
         # DDoS 特徵：
         # 1. 大量不同來源
         # 2. 極高連線數
         # 3. 小封包 - SYN flood 特徵
+        # 4. 不是掃描回應流量
         return (
             unique_srcs > threshold_srcs and
             flow_count > threshold_flows and
