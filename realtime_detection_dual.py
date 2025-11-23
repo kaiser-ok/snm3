@@ -429,12 +429,56 @@ class DualModelAnomalyDetector:
                     # 即使 SRC 被誤判為 Port Scan，只要流量對稱就應該合併
                     is_bidirectional_service = (flow_ratio > 0.8 and target_match)
 
+                    # === 新增：Port 特徵分析 ===
+                    # 檢查 SRC 和 DST 的端口模式是否符合 request-response
+                    src_top_dst_ports = src_record.get('top_dst_ports', {})
+                    dst_top_dst_ports = dst_record.get('top_dst_ports', {})
+
+                    # 知名服務端口 (well-known ports)
+                    WELLKNOWN_PORTS = {161, 162, 53, 80, 443, 22, 23, 25, 110, 143, 389, 636, 3306, 5432, 6379, 27017}
+
+                    # 檢查是否為 request-response 模式
+                    # SRC: random high ports → wellknown port
+                    # DST: wellknown port → random high ports
+                    src_uses_wellknown = False
+                    dst_uses_wellknown = False
+                    common_wellknown_port = None
+
+                    if src_top_dst_ports:
+                        # SRC 的目標端口是否為知名端口
+                        for port_str in src_top_dst_ports.keys():
+                            try:
+                                port = int(port_str)
+                                if port in WELLKNOWN_PORTS:
+                                    src_uses_wellknown = True
+                                    common_wellknown_port = port
+                                    break
+                            except (ValueError, TypeError):
+                                continue
+
+                    if dst_top_dst_ports:
+                        # DST 的目標端口（被訪問的端口）是否為知名端口
+                        for port_str in dst_top_dst_ports.keys():
+                            try:
+                                port = int(port_str)
+                                if port in WELLKNOWN_PORTS:
+                                    dst_uses_wellknown = True
+                                    if common_wellknown_port is None:
+                                        common_wellknown_port = port
+                                    break
+                            except (ValueError, TypeError):
+                                continue
+
+                    # Request-response 模式：SRC 連到知名端口，DST 也在知名端口上接收
+                    has_request_response_port_pattern = (src_uses_wellknown and dst_uses_wellknown)
+
                     # 特別處理：Port Scan + Unknown（可能是 SNMP、DNS 等 request-response 服務）
                     is_request_response_service = (
                         src_threat_class in ['Port Scanning', 'Network Scanning'] and
                         dst_threat_class == 'Unknown Anomaly' and
                         is_bidirectional_service and
-                        src_targets < 100  # 掃描對象不多，可能是正常服務
+                        src_targets < 100 and  # 掃描對象不多，可能是正常服務
+                        has_request_response_port_pattern  # 新增：端口模式匹配
                     )
 
                     # 一般雙向服務模式
@@ -459,15 +503,34 @@ class DualModelAnomalyDetector:
 
                         # 如果是 request-response 服務，添加說明
                         if is_request_response_service:
-                            dst_record['service_note'] = 'Request-Response Service (e.g., SNMP, DNS)'
+                            service_name = f"Port {common_wellknown_port}" if common_wellknown_port else "Unknown"
+                            # 識別常見服務
+                            service_map = {161: 'SNMP', 162: 'SNMP-TRAP', 53: 'DNS', 80: 'HTTP',
+                                         443: 'HTTPS', 22: 'SSH', 23: 'Telnet', 3306: 'MySQL'}
+                            service_name = service_map.get(common_wellknown_port, f"Port {common_wellknown_port}")
+                            dst_record['service_note'] = f'Request-Response Service ({service_name})'
 
                         merged_anomalies.append(dst_record)
-                        print(f"  ✓ 合併 {ip} 的雙向服務（流量比 {flow_ratio:.2f}, 對象數 {src_targets}, SRC={src_threat_class}）")
+
+                        # 顯示合併資訊（包含端口資訊）
+                        port_info = f", Port {common_wellknown_port}" if common_wellknown_port else ""
+                        print(f"  ✓ 合併 {ip} 的雙向服務（流量比 {flow_ratio:.2f}, 對象數 {src_targets}, SRC={src_threat_class}{port_info}）")
                     else:
                         # 其他情況：不合併，保留兩筆記錄（可能是真實威脅）
                         merged_anomalies.append(src_record)
                         merged_anomalies.append(dst_record)
-                        print(f"  ⚠ 保留 {ip} 的雙向異常（SRC={src_threat_class}, DST={dst_threat_class}）")
+
+                        # 顯示保留原因（包含端口差異資訊）
+                        port_reason = ""
+                        if not has_request_response_port_pattern and (src_uses_wellknown or dst_uses_wellknown):
+                            port_reason = ", 端口模式不對稱"
+                        elif not is_bidirectional_service:
+                            if not target_match:
+                                port_reason = f", 對象數不匹配({src_targets}≠{dst_sources})"
+                            elif flow_ratio < 0.8:
+                                port_reason = f", 流量不對稱({flow_ratio:.0%})"
+
+                        print(f"  ⚠ 保留 {ip} 的雙向異常（SRC={src_threat_class}, DST={dst_threat_class}{port_reason}）")
                 else:
                     # 流量比不符，保留兩筆記錄
                     merged_anomalies.append(src_record)
