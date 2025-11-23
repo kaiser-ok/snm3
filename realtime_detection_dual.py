@@ -329,45 +329,74 @@ class DualModelAnomalyDetector:
 
         Returns:
             合併後的異常列表
+        注意：容忍 ±6 分鐘的時間差（因為 SRC/DST transform 可能不同步）
         """
         from collections import defaultdict
+        from datetime import datetime
 
-        # 按 (IP, time_bucket) 分組
-        grouped = defaultdict(lambda: {'src': None, 'dst': None})
+        def normalize_time_bucket(time_bucket, tolerance_minutes=6):
+            """
+            標準化時間 bucket，容忍 ±tolerance_minutes 的時間差
+            將時間 bucket 向下取整到 (tolerance_minutes * 2) 分鐘間隔
+            """
+            if not time_bucket:
+                return None
+            try:
+                if isinstance(time_bucket, str):
+                    dt = datetime.fromisoformat(time_bucket.replace('Z', '+00:00'))
+                else:
+                    dt = datetime.fromtimestamp(time_bucket / 1000)
+
+                # 向下取整到 12 分鐘間隔 (6*2)
+                minute = (dt.minute // (tolerance_minutes * 2)) * (tolerance_minutes * 2)
+                normalized = dt.replace(minute=minute, second=0, microsecond=0)
+                return normalized.isoformat()
+            except Exception:
+                return time_bucket
+
+        # 按 (IP, normalized_time_bucket) 分組
+        grouped = defaultdict(lambda: {'src': [], 'dst': []})
 
         for anomaly in anomalies:
             time_bucket = anomaly.get('time_bucket')
+            normalized_bucket = normalize_time_bucket(time_bucket)
             perspective = anomaly.get('perspective', 'SRC')
 
             # 判斷 IP（SRC 用 src_ip，DST 用 dst_ip）
             if perspective == 'SRC':
                 ip = anomaly.get('src_ip')
-                if ip:
-                    key = (ip, time_bucket)
-                    grouped[key]['src'] = anomaly
+                if ip and normalized_bucket:
+                    key = (ip, normalized_bucket)
+                    grouped[key]['src'].append(anomaly)
             elif perspective == 'DST':
                 ip = anomaly.get('dst_ip')
-                if ip:
-                    key = (ip, time_bucket)
-                    grouped[key]['dst'] = anomaly
+                if ip and normalized_bucket:
+                    key = (ip, normalized_bucket)
+                    grouped[key]['dst'].append(anomaly)
 
         # 合併邏輯
         merged_anomalies = []
+        matched_pairs = set()  # 追蹤已配對的記錄
 
-        for (ip, time_bucket), records in grouped.items():
-            src_record = records['src']
-            dst_record = records['dst']
+        for (ip, normalized_bucket), records in grouped.items():
+            src_records = records['src']
+            dst_records = records['dst']
 
             # 情況 1: 只有 SRC 異常
-            if src_record and not dst_record:
-                merged_anomalies.append(src_record)
+            if src_records and not dst_records:
+                merged_anomalies.extend(src_records)
+                continue
 
             # 情況 2: 只有 DST 異常
-            elif dst_record and not src_record:
-                merged_anomalies.append(dst_record)
+            if dst_records and not src_records:
+                merged_anomalies.extend(dst_records)
+                continue
 
-            # 情況 3: 同時有 SRC 和 DST 異常
-            elif src_record and dst_record:
+            # 情況 3: 同時有 SRC 和 DST 異常 - 嘗試配對
+            # 簡化：取第一個 SRC 和第一個 DST 進行配對，其餘保留
+            if src_records and dst_records:
+                src_record = src_records[0]
+                dst_record = dst_records[0]
                 src_threat_class = src_record['classification'].get('class_name_en', '')
                 dst_threat_class = dst_record['classification'].get('class_name_en', '')
 
@@ -434,12 +463,22 @@ class DualModelAnomalyDetector:
 
                         merged_anomalies.append(dst_record)
                         print(f"  ✓ 合併 {ip} 的雙向服務（流量比 {flow_ratio:.2f}, 對象數 {src_targets}, SRC={src_threat_class}）")
-                        continue
+                    else:
+                        # 其他情況：不合併，保留兩筆記錄（可能是真實威脅）
+                        merged_anomalies.append(src_record)
+                        merged_anomalies.append(dst_record)
+                        print(f"  ⚠ 保留 {ip} 的雙向異常（SRC={src_threat_class}, DST={dst_threat_class}）")
+                else:
+                    # 流量比不符，保留兩筆記錄
+                    merged_anomalies.append(src_record)
+                    merged_anomalies.append(dst_record)
+                    print(f"  ⚠ 保留 {ip} 的雙向異常（SRC={src_threat_class}, DST={dst_threat_class}）")
 
-                # 其他情況：不合併，保留兩筆記錄（可能是真實威脅）
-                merged_anomalies.append(src_record)
-                merged_anomalies.append(dst_record)
-                print(f"  ⚠ 保留 {ip} 的雙向異常（SRC={src_threat_class}, DST={dst_threat_class}）")
+                # 添加剩餘的未配對記錄
+                for extra_src in src_records[1:]:
+                    merged_anomalies.append(extra_src)
+                for extra_dst in dst_records[1:]:
+                    merged_anomalies.append(extra_dst)
 
         return merged_anomalies
 
