@@ -184,6 +184,11 @@ class DualModelAnomalyDetector:
             print(f"  - {threat_class}: {count}")
         print()
 
+        # ===== Step 2b: 合併 SRC/DST 異常視角 =====
+        print("Step 2b: 合併 SRC/DST 異常視角（智能去重）...")
+        classified_anomalies = self._merge_src_dst_anomalies(classified_anomalies)
+        print(f"✓ 合併後剩餘 {len(classified_anomalies)} 個異常\n")
+
         # ===== Step 3: 後處理驗證 =====
         print("Step 3: 雙向驗證（Pattern + Baseline）...")
 
@@ -309,6 +314,134 @@ class DualModelAnomalyDetector:
             print(f"  - 誤報率: {stats['false_positive_rate']*100:.1f}%")
 
             print("\n程序已停止")
+
+    def _merge_src_dst_anomalies(self, anomalies: list) -> list:
+        """
+        合併 SRC 和 DST 視角的異常記錄
+
+        邏輯：
+        1. 如果同一 IP 在同一時間段既有 SRC 異常，又有 DST 異常
+        2. 且符合特定模式（掃描回應、正常服務器等），則合併
+        3. 其他情況保留兩筆記錄（真實威脅）
+
+        Args:
+            anomalies: 原始異常列表
+
+        Returns:
+            合併後的異常列表
+        """
+        from collections import defaultdict
+
+        # 按 (IP, time_bucket) 分組
+        grouped = defaultdict(lambda: {'src': None, 'dst': None})
+
+        for anomaly in anomalies:
+            time_bucket = anomaly.get('time_bucket')
+            perspective = anomaly.get('perspective', 'SRC')
+
+            # 判斷 IP（SRC 用 src_ip，DST 用 dst_ip）
+            if perspective == 'SRC':
+                ip = anomaly.get('src_ip')
+                if ip:
+                    key = (ip, time_bucket)
+                    grouped[key]['src'] = anomaly
+            elif perspective == 'DST':
+                ip = anomaly.get('dst_ip')
+                if ip:
+                    key = (ip, time_bucket)
+                    grouped[key]['dst'] = anomaly
+
+        # 合併邏輯
+        merged_anomalies = []
+
+        for (ip, time_bucket), records in grouped.items():
+            src_record = records['src']
+            dst_record = records['dst']
+
+            # 情況 1: 只有 SRC 異常
+            if src_record and not dst_record:
+                merged_anomalies.append(src_record)
+
+            # 情況 2: 只有 DST 異常
+            elif dst_record and not src_record:
+                merged_anomalies.append(dst_record)
+
+            # 情況 3: 同時有 SRC 和 DST 異常
+            elif src_record and dst_record:
+                src_threat_class = src_record['classification'].get('class_name_en', '')
+                dst_threat_class = dst_record['classification'].get('class_name_en', '')
+
+                # 合併規則 1: 掃描行為（移除掃描回應）
+                if dst_threat_class == 'Scan Response Traffic' and src_threat_class in ['Network Scanning', 'Port Scanning']:
+                    # 將 DST 的統計數據合併到 SRC
+                    src_record['dst_response'] = {
+                        'unique_srcs': dst_record.get('unique_srcs'),
+                        'flow_count': dst_record.get('flow_count'),
+                        'total_bytes': dst_record.get('total_bytes'),
+                        'unique_dst_ports': dst_record.get('unique_dst_ports')
+                    }
+                    merged_anomalies.append(src_record)
+                    print(f"  ✓ 合併 {ip} 的掃描行為（SRC={src_threat_class}, 移除 DST 掃描回應）")
+
+                # 合併規則 2: 正常雙向服務（SNMP、DNS、Web 等）
+                # 檢查連線數是否接近（容許 20% 誤差）
+                src_flows = src_record.get('flow_count', 0)
+                dst_flows = dst_record.get('flow_count', 0)
+                src_targets = src_record.get('unique_dsts', 0)
+                dst_sources = dst_record.get('unique_srcs', 0)
+
+                # 計算流量比和對象數匹配
+                flow_ratio = 0
+                if src_flows > 0 and dst_flows > 0:
+                    flow_ratio = min(src_flows, dst_flows) / max(src_flows, dst_flows)
+                    target_match = (src_targets == dst_sources)
+
+                    # 如果雙向流量接近 + 對象數量匹配 → 這是正常的雙向服務
+                    # 即使 SRC 被誤判為 Port Scan，只要流量對稱就應該合併
+                    is_bidirectional_service = (flow_ratio > 0.8 and target_match)
+
+                    # 特別處理：Port Scan + Unknown（可能是 SNMP、DNS 等 request-response 服務）
+                    is_request_response_service = (
+                        src_threat_class in ['Port Scanning', 'Network Scanning'] and
+                        dst_threat_class == 'Unknown Anomaly' and
+                        is_bidirectional_service and
+                        src_targets < 100  # 掃描對象不多，可能是正常服務
+                    )
+
+                    # 一般雙向服務模式
+                    is_normal_bidirectional = (
+                        src_threat_class in ['Normal High Traffic', 'Unknown Anomaly'] and
+                        dst_threat_class in ['Popular Server', 'Unknown Anomaly'] and
+                        is_bidirectional_service
+                    )
+
+                    if is_request_response_service or is_normal_bidirectional:
+                        # 保留 DST（服務器視角），標記為正常服務
+                        dst_record['is_bidirectional_service'] = True
+                        dst_record['src_traffic'] = {
+                            'flow_count': src_flows,
+                            'total_bytes': src_record.get('total_bytes'),
+                            'unique_dsts': src_targets
+                        }
+                        # 重新分類為正常服務
+                        dst_record['classification']['class_name'] = '正常雙向服務'
+                        dst_record['classification']['class_name_en'] = 'Normal Bidirectional Service'
+                        dst_record['classification']['severity'] = 'LOW'
+
+                        # 如果是 request-response 服務，添加說明
+                        if is_request_response_service:
+                            dst_record['service_note'] = 'Request-Response Service (e.g., SNMP, DNS)'
+
+                        merged_anomalies.append(dst_record)
+                        print(f"  ✓ 合併 {ip} 的雙向服務（流量比 {flow_ratio:.2f}, 對象數 {src_targets}, SRC={src_threat_class}）")
+                        continue
+
+                # 其他情況：不合併，保留兩筆記錄（可能是真實威脅）
+                merged_anomalies.append(src_record)
+                merged_anomalies.append(dst_record)
+                print(f"  ⚠ 保留 {ip} 的雙向異常（SRC={src_threat_class}, DST={dst_threat_class}）")
+
+        return merged_anomalies
 
 
 def main():

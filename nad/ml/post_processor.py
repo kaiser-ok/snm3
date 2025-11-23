@@ -515,7 +515,10 @@ class AnomalyPostProcessor:
         if false_positives:
             report.append("誤報範例（前 5 個）:")
             for i, fp in enumerate(false_positives[:5], 1):
-                report.append(f"  {i}. {fp['src_ip']}")
+                # 根據視角顯示 IP
+                ip = fp.get('src_ip') or fp.get('dst_ip', 'Unknown')
+                perspective = fp.get('perspective', 'SRC')
+                report.append(f"  {i}. [{perspective}] {ip}")
                 report.append(f"     ML 判斷: {fp.get('classification', {}).get('class', 'Unknown')}")
                 report.append(f"     誤報原因: {fp.get('false_positive_reason', 'Unknown')}")
             report.append("")
@@ -524,7 +527,10 @@ class AnomalyPostProcessor:
         if validated:
             report.append("真實異常範例（前 5 個）:")
             for i, v in enumerate(validated[:5], 1):
-                report.append(f"  {i}. {v['src_ip']}")
+                # 根據視角顯示 IP
+                ip = v.get('src_ip') or v.get('dst_ip', 'Unknown')
+                perspective = v.get('perspective', 'SRC')
+                report.append(f"  {i}. [{perspective}] {ip}")
                 report.append(f"     威脅類別: {v.get('classification', {}).get('class', 'Unknown')}")
                 report.append(f"     置信度: {v.get('classification', {}).get('confidence', 0):.0%}")
 
