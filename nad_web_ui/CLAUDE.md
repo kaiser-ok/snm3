@@ -98,10 +98,12 @@ npm run preview
 
 **Pages (`frontend/src/views/`):**
 1. **Dashboard.vue** (`/`):
-   - Time range selector (15/30/60/120 minutes)
+   - Time range selector (15/30/60/120/180/360/720 minutes, default: 180)
    - Execute anomaly detection
-   - Display results grouped by 5-minute time buckets
+   - Display results grouped by 3-minute time buckets
    - Expandable IP details with device type icons
+   - Bar chart visualization (loads historical anomaly counts)
+   - Pie chart for behavior feature distribution
 
 2. **Training.vue** (`/training`):
    - Current model information display
@@ -129,11 +131,42 @@ Frontend (Vue) → Axios API Service → Vite Proxy → Flask Blueprint → Serv
 ```
 
 **Anomaly Detection Flow:**
-1. User selects time range in Dashboard
-2. Frontend calls `POST /api/detection/run` with `{minutes: 60}`
-3. `detector_service.py` queries Elasticsearch for pre-stored anomaly results
-4. Results grouped into 5-minute buckets with device classification
-5. Frontend displays buckets as expandable cards
+1. User selects time range in Dashboard (default: 180 minutes / 3 hours)
+2. Frontend calls `POST /api/detection/run` with `{minutes: 180}`
+3. `detector_service.py` queries Elasticsearch for pre-stored anomaly results from `anomaly_detection-*`
+4. Results are grouped into 3-minute time buckets with device classification
+5. SRC/DST dual perspective anomalies are intelligently merged (see below)
+6. Frontend displays buckets as expandable cards
+
+**Dual Perspective Anomaly Merging (realtime_detection_dual.py):**
+The system analyzes network traffic from both SRC (source) and DST (destination) perspectives:
+
+1. **Separate Detection:**
+   - SRC model: Detects anomalous outbound traffic patterns
+   - DST model: Detects anomalous inbound traffic patterns
+
+2. **Intelligent Merging:**
+   - Groups anomalies by `(IP, normalized_time_bucket)` (±6 min tolerance)
+   - Analyzes bidirectional traffic patterns using:
+     * Flow count ratio (>80% similarity)
+     * Target/source count matching
+     * **Port pattern analysis** (top_dst_ports)
+     * Service identification (SNMP, DNS, HTTP, etc.)
+
+3. **Merge Rules:**
+   - **Rule 1 (Scan Response):** Remove DST "Scan Response" if SRC is "Port/Network Scanning"
+   - **Rule 2 (Bidirectional Service):** Merge if:
+     * Flow ratio > 0.8 AND
+     * Target count matches (unique_dsts == unique_srcs) AND
+     * Both use same well-known port (161, 53, 80, 443, etc.)
+     * Reclassify as "Normal Bidirectional Service"
+   - **Default:** Preserve both records if patterns don't match (different services or real threats)
+
+4. **Port Features Used:**
+   - `top_dst_ports`: Top 5 most frequently used destination ports
+   - `unique_dst_ports`: Total number of unique destination ports
+   - Well-known port detection: {161, 162, 53, 80, 443, 22, 23, 25, 110, 143, 389, 636, 3306, 5432, 6379, 27017}
+   - Service mapping: Automatically identifies SNMP, DNS, HTTP, SSH, MySQL, etc.
 
 **Model Training Flow:**
 1. User configures parameters in Training page
@@ -153,10 +186,26 @@ Frontend (Vue) → Axios API Service → Vite Proxy → Flask Blueprint → Serv
 - Ensure `NAD_BASE_PATH` environment variable is correctly set
 - Model files (.pkl) are stored in `NAD_MODELS_PATH` (default: `/home/kaisermac/snm_flow/nad/models`)
 
-**Elasticsearch Queries:**
-- All services query the `network-flow-*` index pattern
-- Detector service queries pre-computed anomaly results (not real-time detection)
-- Analysis service performs aggregations for IP statistics
+**Elasticsearch Indices:**
+- `radar_flow_collector-*`: Raw NetFlow data (24-hour retention)
+- `netflow_stats_3m_by_src`: 3-minute aggregated SRC perspective traffic statistics
+- `netflow_stats_3m_by_dst`: 3-minute aggregated DST perspective traffic statistics
+- `anomaly_detection-*`: Pre-computed anomaly detection results
+- All services query these indices for different purposes
+
+**Elasticsearch Transforms:**
+- `netflow_agg_3m_by_src`: Aggregates raw NetFlow into 3-minute buckets (SRC perspective)
+  - Delay: 90 seconds
+  - Key features: flow_count, unique_dsts, unique_dst_ports, top_dst_ports, total_bytes
+- `netflow_agg_3m_by_dst`: Aggregates raw NetFlow into 3-minute buckets (DST perspective)
+  - Delay: 90 seconds
+  - Key features: flow_count, unique_srcs, unique_dst_ports, top_dst_ports, total_bytes
+- **Note:** DST transform may lag behind SRC by ~3 minutes due to processing differences
+
+**Detector Service Queries:**
+- Queries `anomaly_detection-*` for pre-computed results (not real-time detection)
+- Results are grouped into 3-minute time buckets
+- Analysis service performs aggregations for IP statistics from `netflow_stats_3m_by_*`
 
 **Error Handling:**
 - All API responses use standardized format: `{"status": "success|error", "data": {...}}`
@@ -232,6 +281,97 @@ curl http://localhost:5000/api/health  # Health check
 2. Serve static files with Nginx
 3. Configure Nginx to proxy `/api/` requests to backend
 4. See `DEPLOYMENT_GUIDE.md` for Nginx configuration example
+
+## Elasticsearch Transform Features
+
+### 3-Minute Aggregation Fields
+
+**SRC Perspective (`netflow_stats_3m_by_src`):**
+```json
+{
+  "src_ip": "192.168.10.100",
+  "time_bucket": "2025-11-23T10:24:00.000Z",
+  "flow_count": 1234,
+  "unique_dsts": 45,
+  "unique_dst_ports": 230,
+  "unique_src_ports": 890,
+  "total_bytes": 5678900,
+  "avg_bytes": 4603,
+  "top_dst_ports": {
+    "80": 500,
+    "443": 400,
+    "53": 200,
+    "22": 100,
+    "161": 34
+  },
+  "top_src_ports": {
+    "49152": 100,
+    "49153": 98,
+    ...
+  },
+  "top_dst_port_concentration": 0.406,
+  "dst_well_known_ratio": 0.85
+}
+```
+
+**DST Perspective (`netflow_stats_3m_by_dst`):**
+```json
+{
+  "dst_ip": "192.168.10.100",
+  "time_bucket": "2025-11-23T10:24:00.000Z",
+  "flow_count": 1200,
+  "unique_srcs": 45,
+  "unique_dst_ports": 5,
+  "unique_src_ports": 800,
+  "total_bytes": 5400000,
+  "avg_bytes": 4500,
+  "top_dst_ports": {
+    "80": 600,
+    "443": 400,
+    "22": 150,
+    "161": 40,
+    "3306": 10
+  },
+  "top_src_ports": {...},
+  "dst_well_known_ratio": 1.0
+}
+```
+
+### Key Metrics Explained
+
+**Port Features:**
+- `top_dst_ports`: Top 5 destination ports with flow counts (critical for service identification)
+- `unique_dst_ports`: Total unique destination ports (high = port scan, low = normal service)
+- `top_dst_port_concentration`: Percentage of flows on the top port (high = focused service)
+- `dst_well_known_ratio`: Percentage of flows to well-known ports (0-1024)
+
+**Traffic Features:**
+- `flow_count`: Total number of NetFlow records in this 3-minute bucket
+- `unique_dsts/srcs`: Number of unique communication targets/sources
+- `total_bytes`: Sum of all bytes transferred
+- `avg_bytes`: Average bytes per flow (small = scan/probe, large = data transfer)
+
+**How Port Features Enable Smart Detection:**
+
+1. **Service Identification:**
+   ```
+   top_dst_ports: {161: 438} → SNMP service
+   top_dst_ports: {53: 1000} → DNS service
+   top_dst_ports: {80: 500, 443: 400} → Web server
+   ```
+
+2. **Port Scan Detection:**
+   ```
+   unique_dst_ports: 438 / flow_count: 442 = 99% dispersion
+   → Scanning different ports on each connection
+   ```
+
+3. **Bidirectional Service Validation:**
+   ```
+   SRC: top_dst_ports: {161: 100} + flow_count: 100
+   DST: top_dst_ports: {161: 98}  + flow_count: 98
+   → Symmetric SNMP request-response pattern
+   ```
 
 ## Common Issues
 
