@@ -15,20 +15,24 @@ import requests
 import json
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime
+from .port_analyzer import PortAnalyzer
 
 
 class BidirectionalAnalyzer:
     """
     雙向流量分析器
 
-    結合 netflow_stats_5m (by src) 和 netflow_stats_5m_by_dst (by dst)
+    結合 netflow_stats_3m_by_src 和 netflow_stats_3m_by_dst
     進行交叉分析，減少誤報並提高偵測準確率。
     """
 
     def __init__(self, es_host="http://localhost:9200"):
         self.es_host = es_host
-        self.src_index = f"{es_host}/netflow_stats_5m/_search"
-        self.dst_index = f"{es_host}/netflow_stats_5m_by_dst/_search"
+        self.src_index = f"{es_host}/netflow_stats_3m_by_src/_search"
+        self.dst_index = f"{es_host}/netflow_stats_3m_by_dst/_search"
+
+        # 通訊埠分析器（非臨時埠計數法）
+        self.port_analyzer = PortAnalyzer(es_host)
 
         # 內部網段定義
         self.internal_networks = [
@@ -44,13 +48,15 @@ class BidirectionalAnalyzer:
 
     def detect_port_scan_improved(self, src_ip: str, time_range: str = "now-5m") -> Dict:
         """
-        改進的 Port Scan 偵測（新增四種進階 Pattern）
+        改進的 Port Scan 偵測（整合非臨時埠計數法）
 
         結合 src 和 dst 視角，識別：
-        1. SINGLE_TARGET_PATTERN: 針對單一目標的垂直掃描（True Vertical Scan）
-        2. BROADCAST_PATTERN: 水平掃描（多目標，相同端口）
-        3. REVERSE_SCAN_PATTERN: Destination 被大量掃描（dst 視角）
-        4. MICROSERVICE_PATTERN: 微服務架構（正常流量）
+        1. SERVER_RESPONSE_TO_CLIENTS: 伺服器回應到客戶端臨時埠（正常）
+        2. DATA_COLLECTION: 資料收集行為（如 WHOIS、API 查詢）（正常）
+        3. SINGLE_TARGET_PATTERN: 針對單一目標的垂直掃描（True Vertical Scan）
+        4. BROADCAST_PATTERN: 水平掃描（多目標，相同端口）
+        5. REVERSE_SCAN_PATTERN: Destination 被大量掃描（dst 視角）
+        6. MICROSERVICE_PATTERN: 微服務架構（正常流量）
 
         Args:
             src_ip: 要分析的源 IP
@@ -65,7 +71,30 @@ class BidirectionalAnalyzer:
         if not src_data:
             return {'is_port_scan': False, 'reason': 'No data found'}
 
-        # 2. 獲取該 src_ip 連接的所有目標的 dst 視角數據
+        # 2. 【新增】使用非臨時埠計數法進行初步判斷
+        port_pattern = self.port_analyzer.analyze_port_pattern(
+            ip=src_ip,
+            perspective='SRC',
+            time_range=time_range,
+            aggregated_data=src_data
+        )
+
+        # 3. 如果識別為正常流量模式，直接返回
+        if port_pattern.get('pattern_type') in ['SERVER_RESPONSE_TO_CLIENTS', 'DATA_COLLECTION']:
+            return {
+                'is_port_scan': False,
+                'pattern': port_pattern['pattern_type'],
+                'confidence': port_pattern.get('confidence', 0.85),
+                'reason': port_pattern.get('details', {}).get('reason', 'Normal traffic pattern detected'),
+                'details': port_pattern.get('details', {}),
+                'port_analysis': {
+                    'unique_ports': src_data.get('unique_dst_ports', 0),
+                    'service_port_count': port_pattern.get('details', {}).get('service_port_count', 0),
+                    'ephemeral_port_count': port_pattern.get('details', {}).get('ephemeral_port_count', 0),
+                }
+            }
+
+        # 4. 獲取該 src_ip 連接的所有目標的 dst 視角數據
         dst_data_list = self._get_targets_perspective(src_ip, time_range)
 
         # 3. SINGLE_TARGET_PATTERN - 垂直掃描（針對單一目標的大量端口）

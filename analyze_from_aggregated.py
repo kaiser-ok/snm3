@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-基於 netflow_stats_5m 聚合數據的異常分析工具
+基於 netflow_stats_3m 聚合數據的異常分析工具
 
 優勢:
 - 查詢速度快 100+ 倍 (只需掃描聚合數據)
 - 數據量小 99%
 - 可進行快速異常偵測
+- 支援 SRC 和 DST 視角分析
 """
 
 import requests
@@ -16,13 +17,24 @@ import sys
 
 # ES 配置
 ES_HOST = "http://localhost:9200"
-AGG_INDEX = "netflow_stats_5m"
+AGG_INDEX_SRC = "netflow_stats_3m_by_src"
+AGG_INDEX_DST = "netflow_stats_3m_by_dst"
 
 class AggregatedDataAnalyzer:
     """基於聚合數據的分析器"""
 
-    def __init__(self):
-        self.es_url = f"{ES_HOST}/{AGG_INDEX}/_search"
+    def __init__(self, perspective='SRC'):
+        """
+        初始化分析器
+
+        Args:
+            perspective: 'SRC' 或 'DST' 視角
+        """
+        self.perspective = perspective
+        if perspective == 'SRC':
+            self.es_url = f"{ES_HOST}/{AGG_INDEX_SRC}/_search"
+        else:
+            self.es_url = f"{ES_HOST}/{AGG_INDEX_DST}/_search"
 
     def analyze_recent(self, hours=1):
         """分析最近 N 小時的聚合數據"""
@@ -249,23 +261,30 @@ class AggregatedDataAnalyzer:
             score += 5
 
         # 端口多樣性
-        if data['unique_ports'] > 50:
+        unique_ports = data.get('unique_dst_ports', 0)
+        if unique_ports > 50:
             score += 10
 
         return min(score, 100)
 
-    def analyze_ip(self, ip, hours=24):
+    def analyze_ip(self, ip, hours=24, perspective=None):
         """深度分析特定 IP"""
+        if perspective is None:
+            perspective = self.perspective
+
         print(f"\n{'='*70}")
-        print(f"IP 深度分析: {ip}")
+        print(f"IP 深度分析: {ip} ({perspective} 視角)")
         print(f"{'='*70}\n")
+
+        # 根據視角選擇查詢欄位
+        ip_field = "src_ip" if perspective == 'SRC' else "dst_ip"
 
         query = {
             "size": 500,
             "query": {
                 "bool": {
                     "must": [
-                        {"term": {"src_ip": ip}},
+                        {"term": {ip_field: ip}},
                         {"range": {"time_bucket": {"gte": f"now-{hours}h"}}}
                     ]
                 }
@@ -283,12 +302,15 @@ class AggregatedDataAnalyzer:
         # 統計分析
         total_connections = 0
         total_traffic = 0
-        max_unique_dsts = 0
+        max_unique_targets = 0
         time_series = []
 
-        print(f"時間序列數據 (每5分鐘):")
+        # 根據視角顯示不同標題
+        target_label = "目的地" if perspective == 'SRC' else "來源"
+
+        print(f"時間序列數據 (每3分鐘):")
         print(f"{'-'*70}")
-        print(f"{'時間':<20} {'連線數':>8} {'流量(MB)':>10} {'目的地':>8} {'平均流量':>12}")
+        print(f"{'時間':<20} {'連線數':>8} {'流量(MB)':>10} {target_label:>8} {'平均流量':>12}")
         print(f"{'-'*70}")
 
         for hit in data['hits']['hits'][:20]:  # 只顯示前20筆
@@ -296,33 +318,46 @@ class AggregatedDataAnalyzer:
             time = datetime.fromisoformat(src['time_bucket'].replace('Z', '+00:00'))
             conns = src['flow_count']
             traffic = src['total_bytes'] / 1024 / 1024
-            dsts = src['unique_dsts']
-            avg = src['avg_bytes']
+
+            # 根據視角獲取目標數
+            targets = src.get('unique_dsts', 0) if perspective == 'SRC' else src.get('unique_srcs', 0)
+            avg = src.get('avg_bytes', 0)
 
             total_connections += conns
             total_traffic += traffic
-            max_unique_dsts = max(max_unique_dsts, dsts)
+            max_unique_targets = max(max_unique_targets, targets)
 
             print(f"{time.strftime('%Y-%m-%d %H:%M'):<20} "
-                  f"{conns:8,} {traffic:10.2f} {dsts:8} {avg:12,.0f}")
+                  f"{conns:8,} {traffic:10.2f} {targets:8} {avg:12,.0f}")
 
         print(f"{'-'*70}")
         print(f"\n統計摘要:")
         print(f"  總連線數: {total_connections:,}")
         print(f"  總流量: {total_traffic:.2f} MB")
-        print(f"  最大目的地數: {max_unique_dsts}")
-        print(f"  平均連線/5分鐘: {total_connections / len(data['hits']['hits']):.0f}")
+        print(f"  最大{target_label}數: {max_unique_targets}")
+        print(f"  平均連線/3分鐘: {total_connections / len(data['hits']['hits']):.0f}")
 
         # 異常判斷
         print(f"\n異常指標:")
-        is_scanning = max_unique_dsts > 50 and total_connections > 500
-        is_high_conn = total_connections > 10000
-        is_high_traffic = total_traffic > 1000  # 1GB
 
-        if is_scanning:
-            print(f"  🔴 掃描行為: 是 (最大目的地: {max_unique_dsts})")
+        if perspective == 'SRC':
+            is_scanning = max_unique_targets > 50 and total_connections > 500
+            is_high_conn = total_connections > 10000
+            is_high_traffic = total_traffic > 1000  # 1GB
+
+            if is_scanning:
+                print(f"  🔴 掃描行為: 是 (最大目的地: {max_unique_targets})")
+            else:
+                print(f"  ✅ 掃描行為: 否")
         else:
-            print(f"  ✅ 掃描行為: 否")
+            is_scanning = max_unique_targets > 50 and total_connections > 500
+            is_high_conn = total_connections > 10000
+            is_high_traffic = total_traffic > 1000
+
+            if is_scanning:
+                print(f"  🔴 被掃描: 是 (最大來源數: {max_unique_targets})")
+            else:
+                print(f"  ✅ 被掃描: 否")
 
         if is_high_conn:
             print(f"  🔴 高連線數: 是 ({total_connections:,})")
@@ -341,16 +376,30 @@ class AggregatedDataAnalyzer:
 
 
 def main():
-    analyzer = AggregatedDataAnalyzer()
-
     if len(sys.argv) > 1:
         # 指定 IP 分析
         ip = sys.argv[1]
         hours = int(sys.argv[2]) if len(sys.argv) > 2 else 24
-        analyzer.analyze_ip(ip, hours)
+        perspective = sys.argv[3].upper() if len(sys.argv) > 3 else 'SRC'
+
+        # 分析 SRC 視角
+        print("\n" + "="*70)
+        print(f"分析 {ip} - SRC 視角 (作為來源)")
+        print("="*70)
+        analyzer_src = AggregatedDataAnalyzer(perspective='SRC')
+        analyzer_src.analyze_ip(ip, hours, perspective='SRC')
+
+        # 分析 DST 視角
+        print("\n" + "="*70)
+        print(f"分析 {ip} - DST 視角 (作為目標)")
+        print("="*70)
+        analyzer_dst = AggregatedDataAnalyzer(perspective='DST')
+        analyzer_dst.analyze_ip(ip, hours, perspective='DST')
+
     else:
         # 一般異常分析
         hours = 1
+        analyzer = AggregatedDataAnalyzer(perspective='SRC')
         result = analyzer.analyze_recent(hours)
 
         # 可選：保存結果

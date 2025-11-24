@@ -182,13 +182,25 @@ class AnomalyPostProcessor:
         elif threat_class == 'NETWORK_SCAN':
             return self._verify_network_scan(src_ip, anomaly, time_range)
 
-        # 3. 其他威脅類別（暫時不驗證）
+        # 3. DDOS_TARGET 驗證（DST 視角）
+        elif threat_class == 'DDOS_TARGET':
+            return self._verify_ddos_target(src_ip, anomaly, time_range)
+
+        # 4. SCAN_TARGET 驗證（DST 視角）
+        elif threat_class == 'SCAN_TARGET':
+            return self._verify_scan_target(src_ip, anomaly, time_range)
+
+        # 5. POPULAR_SERVER 驗證
+        elif threat_class == 'POPULAR_SERVER':
+            return self._verify_popular_server(src_ip, anomaly, time_range)
+
+        # 6. DATA_EXFILTRATION 驗證
+        elif threat_class == 'DATA_EXFILTRATION':
+            return self._verify_data_exfiltration(src_ip, anomaly, time_range)
+
+        # 7. UNKNOWN 和其他威脅類別
         else:
-            return {
-                'is_false_positive': False,
-                'reason': 'No verification needed for this threat class',
-                'details': {}
-            }
+            return self._verify_unknown(src_ip, anomaly, time_range)
 
     def _verify_port_scan(self, src_ip: str, anomaly: Dict, time_range: str) -> Dict:
         """
@@ -219,8 +231,35 @@ class AnomalyPostProcessor:
 
         # 如果雙向分析認為不是 Port Scan（誤報）
         if not verification.get('is_port_scan'):
+            # 【新增】處理非臨時埠計數法識別的正常模式
+            if pattern == 'SERVER_RESPONSE_TO_CLIENTS':
+                return {
+                    'is_false_positive': True,
+                    'reason': 'Server Response to Clients',
+                    'details': {
+                        'pattern': pattern,
+                        'confidence': verification.get('confidence', 0),
+                        'port_analysis': verification.get('port_analysis', {}),
+                        'description': '伺服器回應到客戶端臨時埠（正常流量）',
+                        'evidence': verification.get('reason', 'High ephemeral port ratio detected')
+                    }
+                }
+
+            elif pattern == 'DATA_COLLECTION':
+                return {
+                    'is_false_positive': True,
+                    'reason': 'Data Collection Behavior',
+                    'details': {
+                        'pattern': pattern,
+                        'confidence': verification.get('confidence', 0),
+                        'port_analysis': verification.get('port_analysis', {}),
+                        'description': '資料收集行為（如 WHOIS 查詢、API 調用）',
+                        'evidence': verification.get('reason', 'Limited service ports detected')
+                    }
+                }
+
             # 確定是誤報
-            if pattern == 'MICROSERVICE_PATTERN':
+            elif pattern == 'MICROSERVICE_PATTERN':
                 return {
                     'is_false_positive': True,
                     'reason': 'Microservice Architecture',
@@ -315,7 +354,21 @@ class AnomalyPostProcessor:
                     }
                 }
 
-        # 默認：無法確定，保守處理（可能是掃描）
+        # 默認：如果沒有數據或無法確定
+        # 檢查是否有明確的「非掃描」證據
+        if verification.get('reason') == 'No data found':
+            # 沒有足夠數據驗證，標記為誤報（避免誤告警）
+            return {
+                'is_false_positive': True,
+                'reason': 'Insufficient Data for Verification',
+                'details': {
+                    'pattern': 'NO_DATA',
+                    'confidence': 0.5,
+                    'note': '缺乏雙向數據進行驗證，保守判定為誤報'
+                }
+            }
+
+        # 其他無法確定的情況：保守處理（標記為可能掃描）
         return {
             'is_false_positive': False,
             'reason': 'Uncertain - Default to scan',
@@ -548,3 +601,315 @@ class AnomalyPostProcessor:
         report.append("=" * 70)
 
         return "\n".join(report)
+
+    def _verify_ddos_target(self, target_ip: str, anomaly: Dict, time_range: str) -> Dict:
+        """
+        驗證 DDOS_TARGET（DST 視角）
+
+        分析目標 IP 是否真的遭受 DDoS 攻擊
+        """
+        unique_srcs = anomaly.get('unique_srcs', 0)
+        flow_count = anomaly.get('flow_count', 0)
+        total_bytes = anomaly.get('total_bytes', 0)
+        unique_dst_ports = anomaly.get('unique_dst_ports', 0)
+
+        # 計算攻擊強度
+        avg_flows_per_src = flow_count / unique_srcs if unique_srcs > 0 else 0
+
+        # 判斷 DDoS 類型
+        ddos_type = 'UNKNOWN'
+        if unique_dst_ports == 1:
+            ddos_type = 'TARGETED_SERVICE'  # 針對特定服務
+        elif unique_dst_ports < 5:
+            ddos_type = 'LIMITED_SERVICES'  # 少數服務
+        else:
+            ddos_type = 'DISTRIBUTED'  # 分散式攻擊
+
+        # 計算嚴重程度
+        if unique_srcs > 100:
+            severity = 'CRITICAL'
+        elif unique_srcs > 50:
+            severity = 'HIGH'
+        else:
+            severity = 'MEDIUM'
+
+        return {
+            'is_false_positive': False,
+            'reason': f'Confirmed DDoS Attack - {unique_srcs} sources',
+            'details': {
+                'attack_type': ddos_type,
+                'unique_sources': unique_srcs,
+                'total_flows': flow_count,
+                'total_bytes': total_bytes,
+                'avg_flows_per_source': round(avg_flows_per_src, 2),
+                'targeted_ports': unique_dst_ports,
+                'severity': severity,
+                'description': f'{target_ip} 正遭受來自 {unique_srcs} 個來源的 DDoS 攻擊'
+            }
+        }
+
+    def _verify_scan_target(self, target_ip: str, anomaly: Dict, time_range: str) -> Dict:
+        """
+        驗證 SCAN_TARGET（DST 視角）
+
+        分析目標 IP 是否真的被掃描
+        使用非臨時埠計數法避免誤報
+        """
+        unique_srcs = anomaly.get('unique_srcs', 0)
+        flow_count = anomaly.get('flow_count', 0)
+        unique_dst_ports = anomaly.get('unique_dst_ports', 0)
+
+        # 【新增】使用 PortAnalyzer 進行進階分析
+        # 檢查是否為高臨時埠比例的正常伺服器流量
+        try:
+            # 嘗試獲取更詳細的埠分析（如果有聚合數據）
+            from elasticsearch import Elasticsearch
+            es = Elasticsearch([self.bi_analyzer.es_host])
+
+            # 查詢聚合數據
+            query = {
+                "size": 1,
+                "query": {
+                    "bool": {
+                        "must": [
+                            {"term": {"dst_ip": target_ip}},
+                            {"range": {"time_bucket": {"gte": time_range}}}
+                        ]
+                    }
+                },
+                "sort": [{"time_bucket": "desc"}]
+            }
+
+            result = es.search(index="netflow_stats_3m_by_dst", body=query)
+            if result['hits']['total']['value'] > 0:
+                agg_data = result['hits']['hits'][0]['_source']
+
+                # 使用 PortAnalyzer 分析
+                port_pattern = self.bi_analyzer.port_analyzer.analyze_port_pattern(
+                    ip=target_ip,
+                    perspective='DST',
+                    time_range=time_range,
+                    aggregated_data=agg_data
+                )
+
+                # 如果識別為正常流量模式，標記為誤報
+                if port_pattern.get('pattern_type') in ['NORMAL', 'HYBRID_SERVER_CLIENT', 'MULTI_SERVICE_HOST']:
+                    return {
+                        'is_false_positive': True,
+                        'reason': f'Normal Server Traffic - {port_pattern.get("pattern_type")}',
+                        'details': {
+                            'pattern': port_pattern.get('pattern_type'),
+                            'confidence': port_pattern.get('confidence', 0.85),
+                            'unique_dst_ports': unique_dst_ports,
+                            'service_port_count': port_pattern.get('details', {}).get('unique_ports', 0),
+                            'description': '高臨時埠比例的正常伺服器流量',
+                            'note': port_pattern.get('details', {}).get('reason', '')
+                        }
+                    }
+        except Exception as e:
+            # 如果進階分析失敗，繼續使用原有邏輯
+            pass
+
+        # 計算端口分散度
+        port_diversity = unique_dst_ports / flow_count if flow_count > 0 else 0
+
+        # 判斷掃描類型
+        if port_diversity > 0.8:
+            scan_type = 'HORIZONTAL_SCAN'  # 水平掃描（多端口）
+            threat_level = 'HIGH'
+        elif port_diversity > 0.3:
+            scan_type = 'MIXED_SCAN'  # 混合掃描
+            threat_level = 'MEDIUM'
+        else:
+            scan_type = 'VERTICAL_SCAN'  # 垂直掃描（特定端口）
+            threat_level = 'MEDIUM'
+
+        # 判斷掃描來源
+        if unique_srcs == 1:
+            source_pattern = 'SINGLE_ATTACKER'
+        elif unique_srcs < 5:
+            source_pattern = 'FEW_ATTACKERS'
+        else:
+            source_pattern = 'DISTRIBUTED_SCAN'
+
+        return {
+            'is_false_positive': False,
+            'reason': f'Target Being Scanned - {unique_srcs} sources, {unique_dst_ports} ports',
+            'details': {
+                'scan_type': scan_type,
+                'source_pattern': source_pattern,
+                'unique_sources': unique_srcs,
+                'targeted_ports': unique_dst_ports,
+                'total_flows': flow_count,
+                'port_diversity': round(port_diversity, 3),
+                'threat_level': threat_level,
+                'description': f'{target_ip} 正被 {unique_srcs} 個來源掃描 {unique_dst_ports} 個端口'
+            }
+        }
+
+    def _verify_popular_server(self, server_ip: str, anomaly: Dict, time_range: str) -> Dict:
+        """
+        驗證 POPULAR_SERVER
+
+        分析是否為正常的熱門服務器流量
+        """
+        unique_srcs = anomaly.get('unique_srcs', 0) if 'unique_srcs' in anomaly else anomaly.get('unique_dsts', 0)
+        flow_count = anomaly.get('flow_count', 0)
+        total_bytes = anomaly.get('total_bytes', 0)
+        unique_dst_ports = anomaly.get('unique_dst_ports', 0)
+
+        # 計算流量特徵
+        avg_bytes_per_flow = total_bytes / flow_count if flow_count > 0 else 0
+        clients_per_port = unique_srcs / unique_dst_ports if unique_dst_ports > 0 else 0
+
+        # 判斷服務類型
+        if unique_dst_ports <= 2:
+            service_pattern = 'DEDICATED_SERVICE'  # 專用服務（如 Web Server）
+            is_suspicious = False
+        elif unique_dst_ports <= 5:
+            service_pattern = 'MULTI_SERVICE'  # 多服務
+            is_suspicious = False
+        else:
+            service_pattern = 'MANY_SERVICES'  # 服務過多
+            is_suspicious = True
+
+        # 判斷是否可能誤報
+        if is_suspicious and unique_srcs > 20:
+            return {
+                'is_false_positive': True,
+                'reason': 'Legitimate Popular Server - Too many services',
+                'details': {
+                    'service_pattern': service_pattern,
+                    'unique_clients': unique_srcs,
+                    'service_ports': unique_dst_ports,
+                    'total_flows': flow_count,
+                    'avg_bytes_per_flow': round(avg_bytes_per_flow, 2),
+                    'note': '服務端口過多，可能是應用服務器或微服務架構'
+                }
+            }
+
+        return {
+            'is_false_positive': False,
+            'reason': f'Popular Server - {unique_srcs} clients',
+            'details': {
+                'service_pattern': service_pattern,
+                'unique_clients': unique_srcs,
+                'service_ports': unique_dst_ports,
+                'total_flows': flow_count,
+                'total_bytes': total_bytes,
+                'avg_bytes_per_flow': round(avg_bytes_per_flow, 2),
+                'clients_per_port': round(clients_per_port, 2),
+                'description': f'{server_ip} 為熱門服務器，有 {unique_srcs} 個客戶端連線'
+            }
+        }
+
+    def _verify_data_exfiltration(self, src_ip: str, anomaly: Dict, time_range: str) -> Dict:
+        """
+        驗證 DATA_EXFILTRATION
+
+        分析是否為真實的數據外洩
+        """
+        flow_count = anomaly.get('flow_count', 0)
+        total_bytes = anomaly.get('total_bytes', 0)
+        unique_dsts = anomaly.get('unique_dsts', 0)
+        avg_bytes = anomaly.get('avg_bytes', 0)
+
+        # 計算外洩特徵
+        bytes_per_target = total_bytes / unique_dsts if unique_dsts > 0 else 0
+
+        # 判斷外洩類型
+        if unique_dsts == 1:
+            exfil_type = 'SINGLE_TARGET'  # 單一目標
+            threat_level = 'CRITICAL'
+        elif unique_dsts < 5:
+            exfil_type = 'FEW_TARGETS'  # 少數目標
+            threat_level = 'HIGH'
+        else:
+            exfil_type = 'DISTRIBUTED'  # 分散式
+            threat_level = 'MEDIUM'
+
+        # 判斷數據量
+        if total_bytes > 100 * 1024 * 1024:  # > 100MB
+            data_volume = 'LARGE'
+        elif total_bytes > 10 * 1024 * 1024:  # > 10MB
+            data_volume = 'MEDIUM'
+        else:
+            data_volume = 'SMALL'
+
+        return {
+            'is_false_positive': False,
+            'reason': f'Potential Data Exfiltration - {total_bytes:,} bytes to {unique_dsts} targets',
+            'details': {
+                'exfil_type': exfil_type,
+                'data_volume': data_volume,
+                'total_bytes': total_bytes,
+                'unique_targets': unique_dsts,
+                'bytes_per_target': round(bytes_per_target, 2),
+                'total_flows': flow_count,
+                'avg_bytes_per_flow': round(avg_bytes, 2),
+                'threat_level': threat_level,
+                'description': f'{src_ip} 疑似外洩 {total_bytes:,} bytes 到 {unique_dsts} 個目標'
+            }
+        }
+
+    def _verify_unknown(self, ip: str, anomaly: Dict, time_range: str) -> Dict:
+        """
+        驗證 UNKNOWN 和其他未分類威脅
+
+        提供基本的異常資訊
+        """
+        perspective = anomaly.get('perspective', 'SRC')
+        flow_count = anomaly.get('flow_count', 0)
+        total_bytes = anomaly.get('total_bytes', 0)
+        anomaly_score = anomaly.get('anomaly_score', 0)
+
+        # 從 features 提取關鍵特徵
+        features = anomaly.get('features', {})
+        dst_diversity = features.get('dst_diversity', 0)
+        dst_port_diversity = features.get('dst_port_diversity', 0)
+
+        # 分析異常特徵
+        anomaly_indicators = []
+
+        if perspective == 'SRC':
+            unique_dsts = anomaly.get('unique_dsts', 0)
+            unique_dst_ports = anomaly.get('unique_dst_ports', 0)
+
+            if unique_dsts > 20:
+                anomaly_indicators.append(f'High target count ({unique_dsts})')
+            if dst_port_diversity > 0.5:
+                anomaly_indicators.append(f'High port diversity ({dst_port_diversity:.2f})')
+            if flow_count > 500:
+                anomaly_indicators.append(f'High flow count ({flow_count})')
+
+            target_info = f'{unique_dsts} targets, {unique_dst_ports} ports'
+        else:
+            unique_srcs = anomaly.get('unique_srcs', 0)
+            unique_dst_ports = anomaly.get('unique_dst_ports', 0)
+
+            if unique_srcs > 20:
+                anomaly_indicators.append(f'High source count ({unique_srcs})')
+            if unique_dst_ports > 10:
+                anomaly_indicators.append(f'High port count ({unique_dst_ports})')
+            if flow_count > 500:
+                anomaly_indicators.append(f'High flow count ({flow_count})')
+
+            target_info = f'{unique_srcs} sources, {unique_dst_ports} ports'
+
+        if not anomaly_indicators:
+            anomaly_indicators.append('Anomaly detected by Isolation Forest')
+
+        return {
+            'is_false_positive': False,
+            'reason': f'Unknown Anomaly Pattern ({perspective} perspective)',
+            'details': {
+                'perspective': perspective,
+                'anomaly_score': round(anomaly_score, 4),
+                'flow_count': flow_count,
+                'total_bytes': total_bytes,
+                'target_info': target_info,
+                'indicators': anomaly_indicators,
+                'note': 'This anomaly does not match known attack patterns but shows statistical deviation',
+                'description': f'{ip} 顯示未知異常行為 ({target_info})'
+            }
+        }

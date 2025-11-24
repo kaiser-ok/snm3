@@ -30,6 +30,75 @@ except ImportError:
 class AnomalyVerifier:
     """異常驗證器"""
 
+    # 臨時埠起始點 (Linux 預設 32768, 使用 32000 較寬鬆)
+    EPHEMERAL_PORT_START = 32000
+
+    # 角色特徵庫 (Signature Library)
+    # 格式: 'ROLE_NAME': {'ports': set, 'threshold': float, 'desc': str, 'category': str}
+    ROLE_SIGNATURES = {
+        'DNS_SERVER': {
+            'ports': {53},
+            'threshold': 0.5,  # 流量中超過 50% 是此埠即命中
+            'desc': 'DNS 解析伺服器',
+            'category': 'infrastructure'
+        },
+        'WEB_SERVER': {
+            'ports': {80, 443, 8080, 8443},
+            'threshold': 0.6,
+            'desc': 'Web 網頁伺服器',
+            'category': 'service'
+        },
+        'AD_CONTROLLER': {
+            'ports': {88, 389, 636, 445, 3268, 3269},
+            'threshold': 0.3,  # AD 比較嚴格，通常需要命中多個核心埠
+            'desc': 'Windows AD 網域控制站',
+            'category': 'infrastructure',
+            'core_ports': {88, 389, 53}  # 核心識別埠（需額外驗證）
+        },
+        'FILE_SERVER': {
+            'ports': {445, 139, 2049},
+            'threshold': 0.7,
+            'desc': 'SMB/NFS 檔案伺服器',
+            'category': 'service'
+        },
+        'DB_SERVER': {
+            'ports': {3306, 5432, 1433, 1521, 27017, 6379},
+            'threshold': 0.6,
+            'desc': '資料庫伺服器',
+            'category': 'service'
+        },
+        'MAIL_SERVER': {
+            'ports': {25, 110, 143, 993, 995, 587},
+            'threshold': 0.4,
+            'desc': '郵件伺服器',
+            'category': 'service'
+        },
+        'NTP_SERVER': {
+            'ports': {123},
+            'threshold': 0.6,
+            'desc': 'NTP 時間伺服器',
+            'category': 'infrastructure'
+        },
+        'MONITORING_SYSTEM': {
+            'ports': {161, 162, 9090, 9100, 10050, 10051},
+            'threshold': 0.4,
+            'desc': '監控系統/Agent',
+            'category': 'management'
+        },
+        'PROXY_SERVER': {
+            'ports': {3128, 8080, 8888},
+            'threshold': 0.5,
+            'desc': 'Proxy 代理伺服器',
+            'category': 'service'
+        },
+        'LDAP_SERVER': {
+            'ports': {389, 636},
+            'threshold': 0.7,
+            'desc': 'LDAP 目錄服務',
+            'category': 'infrastructure'
+        }
+    }
+
     def __init__(self, es_client, config):
         self.es = es_client
         self.config = config
@@ -385,9 +454,13 @@ class AnomalyVerifier:
             target_ports = [f['dst_port'] for f in flows if 'dst_port' in f and f['dst_port'] > 0]
             label = 'destination_ports'
         else:  # role == 'dst'
-            # IP 作為目的地：分析來源通訊埠
-            target_ports = [f['src_port'] for f in flows if 'src_port' in f and f['src_port'] > 0]
-            label = 'source_ports'
+            # 【修正】IP 作為目的地：應該分析「哪些服務埠被訪問」(dst_port)
+            # 而不是來源埠，這樣才能正確判斷是否被掃描
+            target_ports = [f['dst_port'] for f in flows if 'dst_port' in f and f['dst_port'] > 0]
+            label = 'targeted_service_ports'
+
+            # 【補充】同時收集來源埠資訊，用於展示（但不用於掃描判定）
+            src_ports = [f['src_port'] for f in flows if 'src_port' in f and f['src_port'] > 0]
 
         port_counter = Counter(target_ports)
         unique_ports = len(port_counter)
@@ -396,28 +469,88 @@ class AnomalyVerifier:
         well_known_ports = {
             80: 'HTTP', 443: 'HTTPS', 53: 'DNS', 22: 'SSH',
             25: 'SMTP', 3389: 'RDP', 21: 'FTP', 23: 'Telnet',
-            445: 'SMB', 3306: 'MySQL', 5432: 'PostgreSQL', 6379: 'Redis'
+            43: 'WHOIS', 445: 'SMB', 3306: 'MySQL', 5432: 'PostgreSQL', 6379: 'Redis',
+            161: 'SNMP', 162: 'SNMP-Trap', 9200: 'Elasticsearch', 9100: 'Prometheus'
         }
+
+        # 分離臨時埠和服務埠
+        ephemeral_ports = []  # >32000 臨時埠（客戶端隨機回傳用）
+        service_ports = []    # <=32000 服務埠（伺服器監聽用）
 
         port_distribution = defaultdict(int)
         for port in target_ports:
             if port < 1024:
                 port_distribution['well_known'] += 1
-            elif port < 49152:
+                service_ports.append(port)
+            elif port <= self.EPHEMERAL_PORT_START:
                 port_distribution['registered'] += 1
+                service_ports.append(port)
             else:
-                port_distribution['dynamic'] += 1
+                port_distribution['ephemeral'] += 1
+                ephemeral_ports.append(port)
+
+        # 非臨時埠計數法：計算有多少個不同的服務埠
+        unique_service_ports = len(set(service_ports))
+        unique_ephemeral_ports = len(set(ephemeral_ports))
+        ephemeral_ratio = len(ephemeral_ports) / len(target_ports) if target_ports else 0
 
         top_ports = port_counter.most_common(10)
 
-        # 檢測掃描模式
-        is_scanning = unique_ports > 20 and len(target_ports) > 100
-        is_sequential_scan = self._check_sequential_ports(list(port_counter.keys()))
+        # 改進的掃描偵測邏輯：使用非臨時埠計數法
+        # 真正的掃描會針對大量「服務埠」(<=32000)
+        # 如果大部分是臨時埠（>32000），且服務埠少，則是正常伺服器回應行為
+        scanning_reason = None
+        if role == 'dst':
+            # DST 角色：判斷是否被掃描
+            if unique_ports > 20:
+                if unique_service_ports < 10:
+                    # 雖然總埠數很多，但服務埠很少 → 正常伺服器 + 客戶端混合流量
+                    is_scanning = False
+                    scanning_reason = 'normal_hybrid_server_client'
+                elif unique_service_ports < 30:
+                    # 服務埠數量適中（10-29）→ 可能是正常的多服務主機
+                    is_scanning = False
+                    scanning_reason = 'limited_service_ports_dst'
+                else:
+                    # 服務埠很多（>=30）→ 真正被掃描
+                    is_scanning = True
+                    scanning_reason = 'many_service_ports_targeted'
+            else:
+                is_scanning = False
+                scanning_reason = 'low_port_count'
+        else:
+            # SRC 角色：同樣使用非臨時埠計數法
+            # 如果作為源連到大量臨時埠 → 這是伺服器回應給客戶端（正常）
+            # 如果作為源連到大量服務埠 → 這是真正的掃描行為（異常）
+            if unique_ports > 20 and len(target_ports) > 100:
+                if ephemeral_ratio > 0.9 and unique_service_ports < 20:
+                    # 連到大量臨時埠，服務埠少 → 伺服器回應流量
+                    is_scanning = False
+                    scanning_reason = 'server_response_to_clients'
+                elif unique_service_ports < 30:
+                    # 服務埠數量少（<30）→ 可能是正常的資料收集（如 WHOIS 查詢）
+                    is_scanning = False
+                    scanning_reason = 'limited_service_ports'
+                else:
+                    # 連到大量服務埠（>=30）→ 真正掃描
+                    is_scanning = True
+                    scanning_reason = 'scanning_many_service_ports'
+            else:
+                is_scanning = False
+                scanning_reason = 'below_threshold'
 
-        return {
+        # 【修正】只檢查服務埠的連續性，不檢查臨時埠
+        # 臨時埠的連續性不代表掃描行為
+        service_port_list = list(set(service_ports))
+        is_sequential_scan = self._check_sequential_ports(service_port_list)
+
+        result = {
             'role': role,
             'label': label,
             'unique_ports': unique_ports,
+            'unique_service_ports': unique_service_ports,
+            'unique_ephemeral_ports': unique_ephemeral_ports,
+            'ephemeral_ratio': ephemeral_ratio,
             'total_connections': len(target_ports),
             'port_diversity_ratio': unique_ports / len(target_ports) if target_ports else 0,
             'top_ports': [{'port': port,
@@ -427,8 +560,25 @@ class AnomalyVerifier:
                          for port, count in top_ports],
             'port_distribution': dict(port_distribution),
             'is_scanning': is_scanning,
+            'scanning_reason': scanning_reason,
             'is_sequential_scan': is_sequential_scan,
         }
+
+        # 【補充】DST 角色時，額外提供來源埠資訊（用於展示，不影響掃描判定）
+        if role == 'dst':
+            src_port_counter = Counter(src_ports)
+            src_service_ports = [p for p in src_ports if p <= self.EPHEMERAL_PORT_START]
+            src_ephemeral_ports = [p for p in src_ports if p > self.EPHEMERAL_PORT_START]
+
+            result['source_port_info'] = {
+                'unique_src_ports': len(src_port_counter),
+                'unique_service_src_ports': len(set(src_service_ports)),
+                'unique_ephemeral_src_ports': len(set(src_ephemeral_ports)),
+                'src_ephemeral_ratio': len(src_ephemeral_ports) / len(src_ports) if src_ports else 0,
+                'note': '來源埠資訊（參考用，掃描判定基於 targeted_service_ports）'
+            }
+
+        return result
 
     def _check_sequential_ports(self, ports):
         """檢查是否為連續通訊埠掃描"""
@@ -542,6 +692,160 @@ class AnomalyVerifier:
             'is_uniform_size': np.std(bytes_list) / np.mean(bytes_list) < 0.3 if np.mean(bytes_list) > 0 else False,
         }
 
+    def _identify_role(self, port_analysis, role='dst'):
+        """
+        根據通訊埠特徵自動識別設備角色
+
+        Args:
+            port_analysis: 埠分析結果（必須包含 top_ports）
+            role: 'src' 或 'dst'
+
+        Returns:
+            list: 識別出的角色列表，每個角色包含:
+                - role: 角色名稱
+                - desc: 角色描述
+                - confidence: 信心度 (HIGH/MEDIUM)
+                - matched_ports: 匹配的埠列表
+                - traffic_ratio: 匹配流量佔比
+        """
+        if not port_analysis.get('top_ports'):
+            return []
+
+        # 計算總流量（連線數）
+        total_count = sum(p['count'] for p in port_analysis['top_ports'])
+        if total_count == 0:
+            return []
+
+        # 轉換 top_ports 為 {port: count} 方便查詢
+        port_counts = {p['port']: p['count'] for p in port_analysis['top_ports']}
+
+        detected_roles = []
+
+        for role_key, sig in self.ROLE_SIGNATURES.items():
+            # 計算命中特徵埠的流量佔比
+            match_count = sum(port_counts.get(p, 0) for p in sig['ports'])
+            ratio = match_count / total_count
+
+            # 基本閾值檢查
+            if ratio < sig['threshold']:
+                continue
+
+            # AD 特殊處理：需要額外檢查核心埠
+            if role_key == 'AD_CONTROLLER' and 'core_ports' in sig:
+                matched_ports_set = sig['ports'] & set(port_counts.keys())
+                core_matched = sig['core_ports'] & matched_ports_set
+                # 至少要匹配 2 個核心埠（如 DNS+Kerberos, DNS+LDAP 等）
+                if len(core_matched) < 2:
+                    continue
+
+            # 信心度判定
+            if ratio > 0.8:
+                confidence = 'HIGH'
+            elif ratio > 0.6:
+                confidence = 'MEDIUM'
+            else:
+                confidence = 'LOW'
+
+            detected_roles.append({
+                'role': role_key,
+                'desc': sig['desc'],
+                'confidence': confidence,
+                'category': sig.get('category', 'unknown'),
+                'matched_ports': sorted(list(sig['ports'] & set(port_counts.keys()))),
+                'traffic_ratio': ratio
+            })
+
+        # 按流量佔比排序（信心度高的在前）
+        detected_roles.sort(key=lambda x: x['traffic_ratio'], reverse=True)
+
+        return detected_roles
+
+    def _identify_domain_controller(self, flows, role, port_analysis):
+        """
+        識別是否為 Active Directory Domain Controller
+
+        AD 特徵:
+        - DST 視角: Port 53/88/389/445 接收大量連線（作為服務提供者）
+        - SRC 視角: Port 53/88/389/445 作為來源埠（主動提供服務）
+
+        Returns:
+            dict: {
+                'is_dc': bool,
+                'confidence': float,
+                'ad_ports': dict,
+                'reason': str
+            }
+        """
+
+        # 統計 AD 相關埠的流量
+        ad_ports = {
+            53: 'DNS',
+            88: 'Kerberos',
+            389: 'LDAP',
+            636: 'LDAPS',
+            445: 'SMB',
+            135: 'RPC',
+            3268: 'Global Catalog',
+            3269: 'Global Catalog SSL'
+        }
+
+        # 從 flows 中統計各埠的流量
+        port_counter = Counter()
+        total_flows = len(flows)
+
+        if role == 'dst':
+            # DST 視角：檢查「被訪問」的埠 (dst_port)
+            for flow in flows:
+                dst_port = flow.get('dst_port', 0)
+                if dst_port in ad_ports:
+                    port_counter[dst_port] += 1
+        else:  # role == 'src'
+            # SRC 視角：檢查「來源埠」(src_port)，AD 伺服器會用這些埠作為來源
+            for flow in flows:
+                src_port = flow.get('src_port', 0)
+                if src_port in ad_ports:
+                    port_counter[src_port] += 1
+
+        ad_traffic = sum(port_counter.values())
+        ad_traffic_ratio = ad_traffic / total_flows if total_flows > 0 else 0
+
+        # 檢查是否有 AD 核心服務 (DNS + Kerberos + LDAP)
+        has_dns = port_counter.get(53, 0) > total_flows * 0.3
+        has_kerberos = port_counter.get(88, 0) > total_flows * 0.05
+        has_ldap = port_counter.get(389, 0) > total_flows * 0.05
+
+        # AD 判定條件
+        is_dc = False
+        confidence = 0.0
+        reason = ''
+
+        if has_dns and has_kerberos and has_ldap:
+            # 同時有 DNS, Kerberos, LDAP → 極高可能性是 AD
+            is_dc = True
+            confidence = 0.95
+            reason = 'Has DNS, Kerberos, and LDAP services (典型 AD 特徵)'
+        elif has_dns and (has_kerberos or has_ldap):
+            # DNS + (Kerberos 或 LDAP) → 高可能性
+            is_dc = True
+            confidence = 0.85
+            reason = 'Has DNS and AD authentication services'
+        elif ad_traffic_ratio > 0.7:
+            # 70% 以上流量是 AD 相關埠 → 可能是 AD
+            is_dc = True
+            confidence = 0.75
+            reason = f'High AD traffic ratio ({ad_traffic_ratio*100:.1f}%)'
+
+        return {
+            'is_dc': is_dc,
+            'confidence': confidence,
+            'ad_ports': dict(port_counter),
+            'ad_traffic_ratio': ad_traffic_ratio,
+            'reason': reason,
+            'has_dns': has_dns,
+            'has_kerberos': has_kerberos,
+            'has_ldap': has_ldap
+        }
+
     def _analyze_behavior(self, flows, role='src'):
         """
         行為分析（根據角色動態調整）
@@ -557,83 +861,231 @@ class AnomalyVerifier:
 
         behaviors = []
 
-        # 檢查是否為常見服務回應流量（只在作為源時檢查）
-        if role == 'src':
-            src_ports = [f.get('src_port', f.get('dst_port', 0)) for f in flows if 'src_port' in f or 'dst_port' in f]
+        # ========================================
+        # Step 1: 自動識別設備角色（基於特徵庫）
+        # ========================================
+        identified_roles = self._identify_role(port_analysis, role)
+
+        # 標記識別出的角色
+        is_known_server = len(identified_roles) > 0
+        management_roles = {'MONITORING_SYSTEM', 'AD_CONTROLLER'}  # 管理類角色
+        current_role_names = {r['role'] for r in identified_roles}
+        is_management = not current_role_names.isdisjoint(management_roles)
+
+        # 添加角色識別標記
+        for r in identified_roles:
+            behaviors.append({
+                'type': f"ROLE_{r['role']}",
+                'severity': 'INFO',
+                'description': f"識別為 {r['desc']} (信心度: {r['confidence']}, 流量佔比: {r['traffic_ratio']*100:.1f}%)",
+                'evidence': {
+                    'matched_ports': r['matched_ports'],
+                    'traffic_ratio': r['traffic_ratio'],
+                    'confidence': r['confidence'],
+                    'category': r['category']
+                }
+            })
+
+        # ========================================
+        # Step 2: 快速路徑 - 伺服器回應流量早期返回
+        # ========================================
+        # 如果是已知的高流量服務（DNS/Web/Mail），且符合典型服務模式，直接返回
+        if role == 'src' and is_known_server:
+            # 檢查是否為伺服器回應模式（來源埠為服務埠）
+            src_ports = [f.get('src_port', 0) for f in flows if 'src_port' in f]
             src_port_counter = Counter(src_ports)
             most_common_src_port = src_port_counter.most_common(1)[0] if src_port_counter else (0, 0)
 
-            # DNS 服務器回應（源通訊埠 53，目的通訊埠多樣化是正常的）
-            if most_common_src_port[0] == 53 and most_common_src_port[1] > len(flows) * 0.8:
-                behaviors.append({
-                    'type': 'DNS_SERVER_RESPONSE',
-                    'severity': 'LOW',
-                    'description': f"DNS 伺服器回應流量（源通訊埠 53）",
-                    'evidence': {
-                        'dns_responses': most_common_src_port[1],
-                        'percentage': most_common_src_port[1] / len(flows) * 100
-                    }
-                })
-                # DNS 服務器不應該被標記為通訊埠掃描
-                return behaviors
+            # 如果主要來源埠是服務埠（且佔比超過 50%），則為典型服務回應
+            service_port_ratio = most_common_src_port[1] / len(flows) if flows else 0
+            if most_common_src_port[0] < self.EPHEMERAL_PORT_START and service_port_ratio > 0.5:
+                # 添加服務回應標記
+                for r in identified_roles:
+                    if r['role'] in ['DNS_SERVER', 'WEB_SERVER', 'MAIL_SERVER']:
+                        behaviors.append({
+                            'type': f"{r['role']}_RESPONSE",
+                            'severity': 'LOW',
+                            'description': f"{r['desc']}回應流量（源通訊埠 {most_common_src_port[0]}）",
+                            'evidence': {
+                                'responses': most_common_src_port[1],
+                                'percentage': service_port_ratio * 100
+                            }
+                        })
+                        # 服務回應流量不應被標記為掃描
+                        return behaviors
 
-            # Web 服務器回應（源通訊埠 80/443）
-            if most_common_src_port[0] in [80, 443] and most_common_src_port[1] > len(flows) * 0.5:
-                behaviors.append({
-                    'type': 'WEB_SERVER_RESPONSE',
-                    'severity': 'LOW',
-                    'description': f"Web 伺服器回應流量（源通訊埠 {most_common_src_port[0]}）",
-                    'evidence': {
-                        'responses': most_common_src_port[1],
-                        'percentage': most_common_src_port[1] / len(flows) * 100
-                    }
-                })
-                return behaviors
-
-        # 掃描行為檢測
+        # ========================================
+        # Step 3: 掃描行為檢測（使用角色特徵豁免邏輯）
+        # ========================================
         if port_analysis['is_scanning'] or port_analysis['is_sequential_scan']:
-            if role == 'src':
-                behaviors.append({
-                    'type': 'PORT_SCANNING',
-                    'severity': 'HIGH',
-                    'description': f"檢測到通訊埠掃描：{port_analysis['unique_ports']} 個不同目的埠",
-                    'evidence': {
-                        'unique_ports': port_analysis['unique_ports'],
-                        'is_sequential': port_analysis['is_sequential_scan']
-                    }
-                })
-            else:  # role == 'dst'
-                behaviors.append({
-                    'type': 'UNDER_PORT_SCAN',
-                    'severity': 'HIGH',
-                    'description': f"檢測到被掃描：來自 {port_analysis['unique_ports']} 個不同來源埠",
-                    'evidence': {
-                        'unique_ports': port_analysis['unique_ports'],
-                        'is_sequential': port_analysis['is_sequential_scan']
-                    }
-                })
+            ignore_scan = False
 
-        if dst_analysis['is_highly_distributed']:
             if role == 'src':
-                behaviors.append({
-                    'type': 'NETWORK_SCANNING',
-                    'severity': 'HIGH',
-                    'description': f"檢測到網路掃描：{dst_analysis['unique_destinations']} 個目的地",
-                    'evidence': {
-                        'unique_destinations': dst_analysis['unique_destinations'],
-                        'dst_diversity': dst_analysis['dst_diversity_ratio']
-                    }
-                })
+                # SRC 視角：監控/管理類角色豁免 PORT_SCANNING
+                if is_management:
+                    # 管理類主機（監控系統、AD）連線多個埠是正常行為
+                    role_desc = ', '.join([r['desc'] for r in identified_roles if r['role'] in management_roles])
+                    behaviors.append({
+                        'type': 'MANAGEMENT_CONNECTIVITY',
+                        'severity': 'LOW',
+                        'description': f"{role_desc}正常管理連線：{port_analysis['unique_service_ports']} 個目的埠（含動態埠 {port_analysis['unique_ephemeral_ports']} 個）",
+                        'evidence': {
+                            'unique_service_ports': port_analysis['unique_service_ports'],
+                            'unique_ephemeral_ports': port_analysis['unique_ephemeral_ports'],
+                            'ephemeral_ratio': port_analysis.get('ephemeral_ratio', 0),
+                            'management_roles': list(current_role_names & management_roles)
+                        }
+                    })
+                    ignore_scan = True
+
+                if not ignore_scan:
+                    behaviors.append({
+                        'type': 'PORT_SCANNING',
+                        'severity': 'HIGH',
+                        'description': f"檢測到通訊埠掃描：{port_analysis['unique_service_ports']} 個服務埠被掃描",
+                        'evidence': {
+                            'unique_service_ports': port_analysis['unique_service_ports'],
+                            'unique_ephemeral_ports': port_analysis['unique_ephemeral_ports'],
+                            'is_sequential': port_analysis['is_sequential_scan']
+                        }
+                    })
+
             else:  # role == 'dst'
-                behaviors.append({
-                    'type': 'UNDER_ATTACK',
-                    'severity': 'HIGH',
-                    'description': f"檢測到遭受攻擊：來自 {dst_analysis['unique_destinations']} 個不同來源",
-                    'evidence': {
-                        'unique_sources': dst_analysis['unique_destinations'],
-                        'source_diversity': dst_analysis['dst_diversity_ratio']
-                    }
-                })
+                # DST 視角：伺服器被大量客戶端連線是正常的（不視為被掃描）
+                if is_known_server:
+                    # 已知服務類型的伺服器，被多個客戶端連線是正常行為
+                    role_desc = ', '.join([r['desc'] for r in identified_roles[:2]])  # 取前兩個角色
+                    behaviors.append({
+                        'type': 'HIGH_LOAD_SERVER',
+                        'severity': 'LOW',
+                        'description': f"{role_desc}高負載：{port_analysis['unique_service_ports']} 個服務埠提供服務",
+                        'evidence': {
+                            'unique_service_ports': port_analysis['unique_service_ports'],
+                            'unique_ephemeral_ports': port_analysis['unique_ephemeral_ports'],
+                            'server_roles': [r['role'] for r in identified_roles]
+                        }
+                    })
+                    ignore_scan = True
+
+                if not ignore_scan:
+                    behaviors.append({
+                        'type': 'UNDER_PORT_SCAN',
+                        'severity': 'HIGH',
+                        'description': f"檢測到被掃描：{port_analysis['unique_service_ports']} 個服務埠被針對",
+                        'evidence': {
+                            'unique_service_ports': port_analysis['unique_service_ports'],
+                            'unique_ephemeral_ports': port_analysis['unique_ephemeral_ports'],
+                            'is_sequential': port_analysis['is_sequential_scan']
+                        }
+                    })
+        elif role == 'dst' and port_analysis.get('scanning_reason') == 'normal_hybrid_server_client':
+            # 雖然埠數多，但主要是臨時埠 → 正常伺服器 + 客戶端混合流量
+            behaviors.append({
+                'type': 'HYBRID_SERVER_CLIENT',
+                'severity': 'LOW',
+                'description': f"混合流量：服務埠 ({port_analysis['unique_service_ports']}) + 臨時埠回傳 ({port_analysis['unique_ephemeral_ports']})",
+                'evidence': {
+                    'unique_service_ports': port_analysis['unique_service_ports'],
+                    'unique_ephemeral_ports': port_analysis['unique_ephemeral_ports'],
+                    'ephemeral_ratio': port_analysis['ephemeral_ratio']
+                }
+            })
+        elif role == 'dst' and port_analysis.get('scanning_reason') == 'limited_service_ports_dst':
+            # DST 角色：有適量服務埠被連 → 多服務主機（正常）
+            behaviors.append({
+                'type': 'MULTI_SERVICE_HOST',
+                'severity': 'LOW',
+                'description': f"多服務主機：{port_analysis['unique_service_ports']} 個服務埠提供服務（含臨時埠 {port_analysis['unique_ephemeral_ports']} 個）",
+                'evidence': {
+                    'unique_service_ports': port_analysis['unique_service_ports'],
+                    'unique_ephemeral_ports': port_analysis['unique_ephemeral_ports'],
+                    'ephemeral_ratio': port_analysis['ephemeral_ratio']
+                }
+            })
+        elif role == 'src' and port_analysis.get('scanning_reason') == 'server_response_to_clients':
+            # SRC 角色：回應到大量臨時埠 → 伺服器回應流量
+            behaviors.append({
+                'type': 'SERVER_RESPONSE_TO_CLIENTS',
+                'severity': 'LOW',
+                'description': f"伺服器回應流量：回應到 {port_analysis['unique_ephemeral_ports']} 個客戶端臨時埠",
+                'evidence': {
+                    'unique_service_ports': port_analysis['unique_service_ports'],
+                    'unique_ephemeral_ports': port_analysis['unique_ephemeral_ports'],
+                    'ephemeral_ratio': port_analysis['ephemeral_ratio']
+                }
+            })
+        elif role == 'src' and port_analysis.get('scanning_reason') == 'limited_service_ports':
+            # SRC 角色：連到少量服務埠 → 資料收集行為（如 WHOIS、API 查詢）
+            behaviors.append({
+                'type': 'DATA_COLLECTION',
+                'severity': 'LOW',
+                'description': f"資料收集行為：連到 {port_analysis['unique_service_ports']} 個服務埠（含臨時埠回傳 {port_analysis['unique_ephemeral_ports']} 個）",
+                'evidence': {
+                    'unique_service_ports': port_analysis['unique_service_ports'],
+                    'unique_ephemeral_ports': port_analysis['unique_ephemeral_ports'],
+                    'top_ports': port_analysis['top_ports'][:5]
+                }
+            })
+
+        # ========================================
+        # Step 4: 高度分散連線檢測（NETWORK_SCANNING / UNDER_ATTACK）
+        # ========================================
+        if dst_analysis['is_highly_distributed']:
+            ignore_distributed = False
+
+            if role == 'src':
+                # SRC 視角：監控/管理類角色豁免 NETWORK_SCANNING
+                if is_management:
+                    role_desc = ', '.join([r['desc'] for r in identified_roles if r['role'] in management_roles])
+                    behaviors.append({
+                        'type': 'MANAGEMENT_MULTI_TARGET',
+                        'severity': 'LOW',
+                        'description': f"{role_desc}正常多目標連線：{dst_analysis['unique_destinations']} 個目的地（管理特性）",
+                        'evidence': {
+                            'unique_destinations': dst_analysis['unique_destinations'],
+                            'dst_diversity': dst_analysis['dst_diversity_ratio'],
+                            'management_roles': list(current_role_names & management_roles)
+                        }
+                    })
+                    ignore_distributed = True
+
+                if not ignore_distributed:
+                    behaviors.append({
+                        'type': 'NETWORK_SCANNING',
+                        'severity': 'HIGH',
+                        'description': f"檢測到網路掃描：{dst_analysis['unique_destinations']} 個目的地",
+                        'evidence': {
+                            'unique_destinations': dst_analysis['unique_destinations'],
+                            'dst_diversity': dst_analysis['dst_diversity_ratio']
+                        }
+                    })
+
+            else:  # role == 'dst'
+                # DST 視角：伺服器被大量來源連線是正常的（不視為被攻擊）
+                if is_known_server:
+                    role_desc = ', '.join([r['desc'] for r in identified_roles[:2]])
+                    behaviors.append({
+                        'type': 'HIGH_CLIENT_LOAD',
+                        'severity': 'LOW',
+                        'description': f"{role_desc}正常客戶端負載：來自 {dst_analysis['unique_destinations']} 個客戶端",
+                        'evidence': {
+                            'unique_sources': dst_analysis['unique_destinations'],
+                            'source_diversity': dst_analysis['dst_diversity_ratio'],
+                            'server_roles': [r['role'] for r in identified_roles]
+                        }
+                    })
+                    ignore_distributed = True
+
+                if not ignore_distributed:
+                    behaviors.append({
+                        'type': 'UNDER_ATTACK',
+                        'severity': 'HIGH',
+                        'description': f"檢測到遭受攻擊：來自 {dst_analysis['unique_destinations']} 個不同來源",
+                        'evidence': {
+                            'unique_sources': dst_analysis['unique_destinations'],
+                            'source_diversity': dst_analysis['dst_diversity_ratio']
+                        }
+                    })
 
         # DNS 濫用（只在作為源時檢查）
         if role == 'src':
@@ -707,13 +1159,19 @@ class AnomalyVerifier:
         low_severity_types = [b['type'] for b in behaviors if b['severity'] == 'LOW']
 
         # 服務器回應流量應該被視為誤報
-        if any(t in ['DNS_SERVER_RESPONSE', 'WEB_SERVER_RESPONSE', 'NORMAL_SERVICE'] for t in low_severity_types):
+        if any(t in ['DNS_SERVER_RESPONSE', 'WEB_SERVER_RESPONSE', 'NORMAL_SERVICE', 'HYBRID_SERVER_CLIENT', 'SERVER_RESPONSE_TO_CLIENTS', 'DATA_COLLECTION', 'MULTI_SERVICE_HOST'] for t in low_severity_types):
             verdict = 'FALSE_POSITIVE'
             confidence = 'HIGH'
             if 'DNS_SERVER_RESPONSE' in low_severity_types:
                 recommendation = '這是 DNS 服務器回應流量，建議調整 Transform 或特徵工程來排除服務器回應'
             elif 'WEB_SERVER_RESPONSE' in low_severity_types:
                 recommendation = '這是 Web 服務器回應流量，建議調整 Transform 或特徵工程來排除服務器回應'
+            elif 'DATA_COLLECTION' in low_severity_types:
+                recommendation = '這是正常的資料收集行為（如 WHOIS 查詢、API 調用），建議調整特徵閾值'
+            elif 'MULTI_SERVICE_HOST' in low_severity_types:
+                recommendation = '這是正常的多服務主機流量，建議調整特徵閾值'
+            elif 'HYBRID_SERVER_CLIENT' in low_severity_types or 'SERVER_RESPONSE_TO_CLIENTS' in low_severity_types:
+                recommendation = '這是正常的伺服器回應流量（回應到客戶端臨時埠），建議調整特徵閾值'
             else:
                 recommendation = '建議調整特徵閾值，降低此類誤報'
         elif high_severity > 0:
@@ -769,12 +1227,12 @@ class AnomalyVerifier:
                 recommendation = f'檢測到 {high_severity_count} 個高危異常行為，建議立即調查'
             else:
                 recommendation = '檢測到高危異常行為，建議立即調查'
-        elif any(t in ['DNS_SERVER_RESPONSE', 'WEB_SERVER_RESPONSE', 'NORMAL_SERVICE'] for t in low_severity_types):
+        elif any(t in ['DNS_SERVER_RESPONSE', 'WEB_SERVER_RESPONSE', 'NORMAL_SERVICE', 'HYBRID_SERVER_CLIENT', 'SERVER_RESPONSE_TO_CLIENTS', 'DATA_COLLECTION', 'MULTI_SERVICE_HOST'] for t in low_severity_types):
             # 如果有高危行為，不應該被服務器回應掩蓋
             if high_severity_count == 0:
                 verdict = 'FALSE_POSITIVE'
                 confidence = 'HIGH'
-                recommendation = '主要為正常服務流量，建議調整特徵閾值'
+                recommendation = '主要為正常服務流量（資料收集、多服務主機或伺服器回應），建議調整特徵閾值'
             else:
                 verdict = 'MIXED'
                 confidence = 'MEDIUM'
@@ -918,19 +1376,31 @@ class AnomalyVerifier:
         if role == 'src':
             print(f"🔌 目的通訊埠分析:")
         else:
-            print(f"🔌 來源通訊埠分析:")
+            print(f"🔌 被訪問的服務埠分析 (判斷是否被掃描):")
         print(f"   • 不同通訊埠數量: {port['unique_ports']}")
+        if role == 'dst':
+            # DST 角色顯示詳細分類
+            print(f"   • 服務埠: {port['unique_service_ports']} 個, 臨時埠: {port['unique_ephemeral_ports']} 個 ({port['ephemeral_ratio']*100:.1f}%)")
 
         # 顯示 TOP 5 通訊埠
         if port['top_ports']:
             if role == 'src':
                 print(f"\n   TOP 5 目的通訊埠:")
             else:
-                print(f"\n   TOP 5 來源通訊埠:")
+                print(f"\n   TOP 5 被訪問的服務埠:")
             for i, port_info in enumerate(port['top_ports'][:5], 1):
                 print(f"      {i}. {port_info['port']:5d} ({port_info['service']:15s}) → {port_info['count']:5,} 次 ({port_info['percentage']:.1f}%)")
             print()
         else:
+            print()
+
+        # DST 視角時，補充顯示來源埠資訊
+        if role == 'dst' and 'source_port_info' in port:
+            src_info = port['source_port_info']
+            print(f"📎 補充：來源埠資訊 (參考用，不影響掃描判定)")
+            print(f"   • 不同來源埠數量: {src_info['unique_src_ports']}")
+            print(f"   • 服務來源埠: {src_info['unique_service_src_ports']} 個, 臨時來源埠: {src_info['unique_ephemeral_src_ports']} 個")
+            print(f"   • 來源臨時埠比例: {src_info['src_ephemeral_ratio']*100:.1f}%")
             print()
 
         # 行為分析
@@ -1035,17 +1505,24 @@ class AnomalyVerifier:
             port_title = "🔌 目的通訊埠分析:"
             port_label = "目的通訊埠"
         else:  # role == 'dst'
-            port_title = "🔌 來源通訊埠分析:"
-            port_label = "來源通訊埠"
+            port_title = "🔌 被訪問的服務埠分析 (判斷是否被掃描):"
+            port_label = "被訪問的服務埠"
 
         print(port_title)
         print(f"   • 不同{port_label}數量: {port['unique_ports']}")
         print(f"   • {port_label}分散度: {port['port_diversity_ratio']:.3f}")
+        if role == 'dst':
+            # DST 角色顯示服務埠和臨時埠分布
+            print(f"   • 服務埠 (≤{self.EPHEMERAL_PORT_START}): {port['unique_service_ports']} 個")
+            print(f"   • 臨時埠 (>{self.EPHEMERAL_PORT_START}): {port['unique_ephemeral_ports']} 個")
+            print(f"   • 臨時埠比例: {port['ephemeral_ratio']*100:.1f}%")
         if port['is_scanning']:
             if role == 'src':
-                print(f"   ⚠️  疑似通訊埠掃描")
+                print(f"   ⚠️  疑似通訊埠掃描 (原因: {port.get('scanning_reason', 'unknown')})")
             else:
-                print(f"   ⚠️  疑似被通訊埠掃描")
+                print(f"   ⚠️  疑似被通訊埠掃描 (原因: {port.get('scanning_reason', 'unknown')})")
+        elif role == 'dst' and port.get('scanning_reason') == 'normal_hybrid_server_client':
+            print(f"   ✓ 正常混合流量 (服務埠少，大部分為臨時埠回傳)")
         if port['is_sequential_scan']:
             print(f"   ⚠️  檢測到連續通訊埠模式")
 

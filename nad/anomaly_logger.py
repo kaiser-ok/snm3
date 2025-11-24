@@ -68,6 +68,10 @@ class AnomalyLogger:
                     "total_bytes": {"type": "long"},
                     "avg_bytes": {"type": "long"},
 
+                    # 後處理驗證結果
+                    "validation_result": {"type": "keyword"},
+                    "verification_details": {"type": "object", "enabled": False},
+
                     # 威胁分类信息
                     "threat_class": {"type": "keyword"},
                     "threat_class_en": {"type": "keyword"},
@@ -88,7 +92,15 @@ class AnomalyLogger:
         }
 
         try:
-            self.es.indices.put_template(name=template_name, body=template)
+            # 使用新版 put_index_template API (ES 7.8+)
+            self.es.indices.put_index_template(name=template_name, body={
+                "index_patterns": template["index_patterns"],
+                "template": {
+                    "settings": template["settings"],
+                    "mappings": template["mappings"]
+                }
+            })
+            print(f"✓ 索引模板已創建: {template_name}")
         except Exception as e:
             print(f"警告: 创建索引模板失败: {e}")
 
@@ -184,9 +196,14 @@ class AnomalyLogger:
             "unique_dst_ports": anomaly.get('unique_dst_ports'),
             "total_bytes": anomaly.get('total_bytes'),
             "avg_bytes": anomaly.get('avg_bytes'),
+            "validation_result": anomaly.get('validation_result'),  # 驗證結果
             "behavior_features": ', '.join(behaviors) if behaviors else None,
             "features": anomaly.get('features', {})
         }
+
+        # 寫入 verification_details（即使是空字典也寫入）
+        if 'verification_details' in anomaly:
+            doc["verification_details"] = anomaly['verification_details']
 
         # 添加威胁分类信息（如果有）
         if classification:
@@ -300,8 +317,13 @@ class AnomalyLogger:
                 "unique_dst_ports": anomaly.get('unique_dst_ports'),
                 "total_bytes": anomaly.get('total_bytes'),
                 "avg_bytes": anomaly.get('avg_bytes'),
+                "validation_result": anomaly.get('validation_result'),
                 "behavior_features": ', '.join(behaviors) if behaviors else None
             }
+
+            # 寫入 verification_details（即使是空字典也寫入）
+            if 'verification_details' in anomaly:
+                doc["verification_details"] = anomaly['verification_details']
 
             if classification:
                 doc.update({
