@@ -63,14 +63,18 @@ class LLMService:
         try:
             import openai
 
-            # 建立客戶端
+            # 建立客戶端（設置 300 秒超時，適應 thinking 模型）
             if use_openrouter:
                 client = openai.OpenAI(
                     api_key=api_key,
-                    base_url=api_base
+                    base_url=api_base,
+                    timeout=300.0  # 5 分鐘超時
                 )
             else:
-                client = openai.OpenAI(api_key=api_key)
+                client = openai.OpenAI(
+                    api_key=api_key,
+                    timeout=300.0  # 5 分鐘超時
+                )
 
             # 準備提示詞
             if custom_prompt:
@@ -109,7 +113,7 @@ class LLMService:
                     }
                 ],
                 "temperature": 0.3,
-                "max_tokens": 2000
+                "max_tokens": 4000  # 增加到 4000 以支持 thinking 模型的完整输出
             }
 
             # 如果使用 OpenRouter，添加額外標頭
@@ -126,11 +130,19 @@ class LLMService:
             # 調用 API
             response = client.chat.completions.create(**api_params)
 
-            analysis_text = response.choices[0].message.content
+            # 提取分析文本（支持 thinking 模型）
+            message = response.choices[0].message
+            analysis_text = message.content
+
+            # ✅ 處理 thinking 模型（如 Gemini 3 Pro Preview, Qwen Thinking 等）
+            # 這些模型使用 reasoning 字段而不是 content 字段
+            if not analysis_text and hasattr(message, 'reasoning') and message.reasoning:
+                analysis_text = message.reasoning
+                print(f"INFO: 模型 {model_id} 使用 reasoning 字段（thinking 模型）")
 
             return {
                 'status': 'success',
-                'analysis': analysis_text,
+                'analysis': analysis_text or '',  # 確保不返回 None
                 'model': model_id,
                 'tokens_used': {
                     'prompt': response.usage.prompt_tokens if response.usage else 0,
@@ -144,10 +156,32 @@ class LLMService:
                 'status': 'error',
                 'error': '請安裝 openai 套件: pip install openai'
             }
-        except Exception as e:
+        except openai.APITimeoutError as e:
             return {
                 'status': 'error',
-                'error': f'LLM 分析失敗: {str(e)}'
+                'error': f'LLM API 超時 (>300秒)，模型 {model_id} 可能響應較慢，請稍後重試或選擇其他模型'
+            }
+        except openai.RateLimitError as e:
+            return {
+                'status': 'error',
+                'error': f'LLM API 速率限制: {str(e)}'
+            }
+        except openai.APIError as e:
+            return {
+                'status': 'error',
+                'error': f'LLM API 錯誤: {str(e)}'
+            }
+        except Exception as e:
+            error_msg = str(e)
+            # 提供更友好的错误信息
+            if 'timeout' in error_msg.lower():
+                return {
+                    'status': 'error',
+                    'error': f'請求超時: 模型 {model_id} 響應時間過長 (>300秒)，建議選擇更快的模型'
+                }
+            return {
+                'status': 'error',
+                'error': f'LLM 分析失敗: {error_msg}'
             }
 
     def _load_device_mapping(self) -> Optional[Dict]:
@@ -353,12 +387,26 @@ class LLMService:
 
         if threat:
             prompt += f"""
-**威脅分類**
+**威脅分類 (Threat Classification)**
 - 類型: {threat.get('class_name')} ({threat.get('class_name_en')})
 - 嚴重性: {threat.get('severity')}
 - 置信度: {threat.get('confidence', 0) * 100:.1f}%
 - 描述: {threat.get('description')}
 """
+            # 添加威脅指標
+            indicators = threat.get('indicators', [])
+            if indicators:
+                prompt += f"\n**威脅指標 (Threat Indicators)**\n"
+                for indicator in indicators:
+                    prompt += f"  • {indicator}\n"
+
+            # 添加建議措施
+            response = threat.get('response', [])
+            if response:
+                prompt += f"\n**系統建議應對措施**\n"
+                for action in response:
+                    prompt += f"  • {action}\n"
+
 
         # 根據是否為公網 IP 決定分析要求
         is_public_ip = ip_info and ip_info.get('is_public', False)

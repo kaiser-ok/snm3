@@ -361,6 +361,12 @@ const availableModels = ref([
     free: false
   },
   {
+    id: 'google/gemini-3-pro-preview',
+    name: 'Gemini 3 Pro Preview',
+    provider: 'Google (via OpenRouter)',
+    free: false
+  },
+  {
     id: 'x-ai/grok-4-fast',
     name: 'Grok 4 Fast',
     provider: 'xAI (via OpenRouter)',
@@ -379,9 +385,9 @@ const availableModels = ref([
     free: true
   },
   {
-    id: 'anthropic/claude-3.5-sonnet',
-    name: 'Claude 3.5 Sonnet',
-    provider: 'Anthropic (via OpenRouter)',
+    id: 'moonshotai/kimi-k2-thinking',
+    name: 'Kimi K2 Thinking',
+    provider: 'MoonshotAI (via OpenRouter)',
     free: false
   },
   {
@@ -787,13 +793,21 @@ function generatePromptPreview(data) {
 - 不重複目的埠: ${(stats.unique_dst_ports || 0).toLocaleString()} ports
 - 不重複來源埠: ${(stats.unique_src_ports || 0).toLocaleString()} ports
 
-**威脅分類**
+**威脅分類 (Threat Classification)**
 ${data.threat_classification ? `
 - 類型: ${data.threat_classification.class_name} (${data.threat_classification.class_name_en})
 - 嚴重性: ${data.threat_classification.severity}
 - 置信度: ${(data.threat_classification.confidence * 100).toFixed(1)}%
 - 描述: ${data.threat_classification.description}
 ` : '無威脅分類資訊'}
+${data.threat_classification?.indicators?.length > 0 ? `
+**威脅指標 (Threat Indicators)**
+${data.threat_classification.indicators.map(ind => `  • ${ind}`).join('\n')}
+` : ''}
+${data.threat_classification?.response?.length > 0 ? `
+**系統建議應對措施**
+${data.threat_classification.response.map(res => `  • ${res}`).join('\n')}
+` : ''}
 
 請根據以上數據提供：
 1. 安全摘要

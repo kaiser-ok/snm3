@@ -187,7 +187,7 @@ The system analyzes network traffic from both SRC (source) and DST (destination)
 - Model files (.pkl) are stored in `NAD_MODELS_PATH` (default: `/home/kaisermac/snm_flow/nad/models`)
 
 **Elasticsearch Indices:**
-- `radar_flow_collector-*`: Raw NetFlow data (24-hour retention)
+- `flow_collector-*`: Raw NetFlow data (24-hour retention)
 - `netflow_stats_3m_by_src`: 3-minute aggregated SRC perspective traffic statistics
 - `netflow_stats_3m_by_dst`: 3-minute aggregated DST perspective traffic statistics
 - `anomaly_detection-*`: Pre-computed anomaly detection results

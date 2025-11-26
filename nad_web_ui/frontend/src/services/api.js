@@ -119,7 +119,7 @@ export const analysisAPI = {
   // 支援傳入 model_id, use_openrouter, custom_prompt, response_format 等參數
   getLLMSecurityReport(data) {
     return api.post('/analysis/llm-security-report', data, {
-      timeout: 120000 // LLM API 需要 120 秒超時
+      timeout: 300000 // LLM API 需要 300 秒超時（5分鐘，適應 thinking 模型）
     })
   }
 }

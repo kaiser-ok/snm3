@@ -370,7 +370,11 @@ class DetectorService:
 
     def _group_by_bucket(self, anomalies: List[Dict], minutes: int = None, start_time: str = None, end_time: str = None) -> List[Dict]:
         """
-        按 10 分鐘時間 bucket 分組異常，填充完整時間範圍
+        按 3 分鐘時間 bucket 分組異常，填充完整時間範圍
+
+        【修正】每個 bucket 的 anomalies 列表按不重複 IP 去重
+        - anomaly_count = 不重複 IP 數量
+        - anomalies = 每個 IP 只保留一筆記錄（優先選擇異常分數最高的）
 
         Args:
             anomalies: 異常列表
@@ -383,30 +387,68 @@ class DetectorService:
         """
         from datetime import datetime, timedelta, timezone
 
-        # 首先按 time_bucket 分組異常，並計算不重複 IP
-        buckets_dict = {}
+        # 計算時間範圍
+        if start_time and end_time:
+            # 解析 ISO 格式時間
+            start_dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+            end_dt = datetime.fromisoformat(end_time.replace('Z', '+00:00'))
+        else:
+            # 使用分鐘數計算
+            end_dt = datetime.now(timezone.utc)
+            start_dt = end_dt - timedelta(minutes=minutes or 60)
+
+        # 對齊到 3 分鐘邊界（與 ES Transform 的 bucket 對齊）
+        # 向下對齊 start_dt
+        start_dt = start_dt.replace(
+            minute=(start_dt.minute // 3) * 3,
+            second=0,
+            microsecond=0
+        )
+        # 向上對齊 end_dt
+        end_minute = (end_dt.minute // 3) * 3
+        if end_dt.minute % 3 != 0 or end_dt.second > 0:
+            end_minute += 3
+        if end_minute >= 60:
+            end_dt = end_dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        else:
+            end_dt = end_dt.replace(minute=end_minute, second=0, microsecond=0)
+
+        # 生成所有時間 bucket（每 3 分鐘一個）
+        all_buckets = {}
+        current = start_dt
+        while current <= end_dt:
+            bucket_str = current.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+            all_buckets[bucket_str] = {
+                'time_bucket': bucket_str,
+                'anomaly_count': 0,
+                'anomalies': [],
+                'ip_records': {}  # 用於按 IP 去重，{ip: best_anomaly_record}
+            }
+            current += timedelta(minutes=3)
+
+        # 將異常分配到對應的 bucket（按 IP 去重，保留異常分數最高的記錄）
         for anomaly in anomalies:
             bucket_time = anomaly.get('time_bucket')
-            src_ip = anomaly.get('src_ip')
+            # 支援 SRC 和 DST 異常
+            ip = anomaly.get('src_ip') or anomaly.get('dst_ip')
+            anomaly_score = anomaly.get('anomaly_score', 0)
 
-            if bucket_time not in buckets_dict:
-                buckets_dict[bucket_time] = {
-                    'time_bucket': bucket_time,
-                    'anomaly_count': 0,
-                    'anomalies': [],
-                    'unique_ips': set()
-                }
+            if bucket_time in all_buckets and ip:
+                ip_records = all_buckets[bucket_time]['ip_records']
 
-            buckets_dict[bucket_time]['anomalies'].append(anomaly)
-            buckets_dict[bucket_time]['unique_ips'].add(src_ip)
+                # 如果這個 IP 還沒有記錄，或新記錄的異常分數更高，則更新
+                if ip not in ip_records or anomaly_score > ip_records[ip].get('anomaly_score', 0):
+                    ip_records[ip] = anomaly
 
-        # 計算每個 bucket 的不重複 IP 數量
-        for bucket_data in buckets_dict.values():
-            bucket_data['anomaly_count'] = len(bucket_data['unique_ips'])
-            del bucket_data['unique_ips']  # 移除 set（無法 JSON 序列化）
+        # 將去重後的記錄轉換為 anomalies 列表
+        for bucket_data in all_buckets.values():
+            ip_records = bucket_data['ip_records']
+            bucket_data['anomalies'] = list(ip_records.values())
+            bucket_data['anomaly_count'] = len(ip_records)
+            del bucket_data['ip_records']  # 移除暫存的 dict
 
         # 轉換為排序列表
-        buckets = sorted(buckets_dict.values(), key=lambda x: x['time_bucket'])
+        buckets = sorted(all_buckets.values(), key=lambda x: x['time_bucket'])
 
         return buckets
 

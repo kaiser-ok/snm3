@@ -173,7 +173,7 @@ class AnalysisService:
             }
         }
 
-        cardinality_resp = self.es.search(index="radar_flow_collector-*", body=cardinality_query)
+        cardinality_resp = self.es.search(index="flow_collector-*", body=cardinality_query)
         cardinality_aggs = cardinality_resp.get('aggregations', {})
 
         return {
@@ -263,8 +263,8 @@ class AnalysisService:
         }
 
         try:
-            dsts_response = self.es.search(index="radar_flow_collector-*", body=top_dsts_query)
-            port_response = self.es.search(index="radar_flow_collector-*", body=port_dist_query)
+            dsts_response = self.es.search(index="flow_collector-*", body=top_dsts_query)
+            port_response = self.es.search(index="flow_collector-*", body=port_dist_query)
 
             # 檢查是否有數據
             total_hits = dsts_response.get('hits', {}).get('total', {}).get('value', 0)
@@ -553,8 +553,8 @@ class AnalysisService:
                             'severity_emoji': severity_emoji,
                             'priority': anomaly_record.get('priority', 'P2'),
                             'description': anomaly_record.get('description', ''),
-                            'indicators': indicators_list[:3],
-                            'response': response_list[:1],
+                            'indicators': indicators_list,  # 返回所有 indicators（不限制）
+                            'response': response_list,  # 返回所有 response（不限制）
                             'detection_time': anomaly_record.get('detection_time', timestamp.isoformat())
                         }
             except Exception as e:
@@ -588,8 +588,8 @@ class AnalysisService:
                 'severity_emoji': severity_emoji,
                 'priority': classification['priority'],
                 'description': classification['description'],
-                'indicators': classification.get('indicators', [])[:3],
-                'response': classification.get('response', [])[:1],
+                'indicators': classification.get('indicators', []),  # 返回所有 indicators（不限制）
+                'response': classification.get('response', []),  # 返回所有 response（不限制）
                 'detection_time': detection_time_str
             }
         except Exception as e:
