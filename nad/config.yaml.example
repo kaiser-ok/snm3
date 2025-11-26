@@ -2,7 +2,7 @@ elasticsearch:
   host: http://localhost:9200
   indices:
     aggregated: netflow_stats_5m
-    raw: radar_flow_collector-*
+    raw: flow_collector-*
   timeout: 30
 features:
   basic:

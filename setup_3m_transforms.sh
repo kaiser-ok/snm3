@@ -14,7 +14,7 @@ echo "  - 聚合間隔: 3 分鐘 (fixed_interval: 3m)"
 echo "  - 執行頻率: 3 分鐘 (frequency: 3m)"
 echo "  - 延遲時間: 90 秒 (delay: 90s)"
 echo "  - 時區: Asia/Taipei"
-echo "  - 資料來源: radar_flow_collector-* (最近 15 分鐘)"
+echo "  - 資料來源: flow_collector-* (最近 15 分鐘)"
 echo ""
 echo "========================================================================"
 echo ""
@@ -29,7 +29,7 @@ curl -X PUT "${ES_HOST}/_transform/netflow_agg_3m_by_src" \
   -H 'Content-Type: application/json' \
   -d '{
   "source": {
-    "index": ["radar_flow_collector-*"],
+    "index": ["flow_collector-*"],
     "query": {
       "range": {
         "FLOW_START_MILLISECONDS": {
@@ -145,7 +145,7 @@ curl -X PUT "${ES_HOST}/_transform/netflow_agg_3m_by_dst" \
   -H 'Content-Type: application/json' \
   -d '{
   "source": {
-    "index": ["radar_flow_collector-*"],
+    "index": ["flow_collector-*"],
     "query": {
       "range": {
         "FLOW_START_MILLISECONDS": {

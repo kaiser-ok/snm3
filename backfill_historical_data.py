@@ -18,7 +18,7 @@ import sys
 
 # ES 配置
 ES_HOST = "http://localhost:9200"
-SOURCE_INDEX = "radar_flow_collector-*"
+SOURCE_INDEX = "flow_collector-*"
 
 # 聚合模式配置
 AGGREGATION_MODES = {

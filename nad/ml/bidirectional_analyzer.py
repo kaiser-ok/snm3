@@ -94,6 +94,37 @@ class BidirectionalAnalyzer:
                 }
             }
 
+        # 3.5【新增】檢查是否為正常客戶端行為（連到多個目的地但主要是常見服務）
+        unique_dsts = src_data.get('unique_dsts', 0)
+        unique_dst_ports = src_data.get('unique_dst_ports', 0)
+
+        if unique_dsts > 50:  # 高度分散連線
+            # 使用 PortAnalyzer 的常見客戶端埠定義
+            common_client_ports = PortAnalyzer.COMMON_CLIENT_PORTS
+
+            # 從 top_dst_ports 計算常見埠流量佔比（如果聚合數據有這個欄位）
+            # 暫時用啟發式規則：如果 unique_dst_ports < 30 且 unique_dsts > 50，可能是正常客戶端
+            if unique_dst_ports < 30:
+                normal_client_check = PortAnalyzer.check_normal_client_activity(
+                    unique_targets=unique_dsts,
+                    service_port_count=unique_dst_ports,
+                    common_port_ratio=0.6,  # 預設假設常見埠佔比較高
+                    top_dst_ports=[]
+                )
+
+                if normal_client_check.get('is_normal_client'):
+                    return {
+                        'is_port_scan': False,
+                        'pattern': 'NORMAL_CLIENT_ACTIVITY',
+                        'confidence': normal_client_check.get('confidence', 0.85),
+                        'reason': normal_client_check.get('reason', 'Normal client activity detected'),
+                        'details': {
+                            'unique_dsts': unique_dsts,
+                            'unique_dst_ports': unique_dst_ports,
+                            **normal_client_check.get('details', {})
+                        }
+                    }
+
         # 4. 獲取該 src_ip 連接的所有目標的 dst 視角數據
         dst_data_list = self._get_targets_perspective(src_ip, time_range)
 

@@ -44,6 +44,9 @@ class PortAnalyzer:
         9100: 'Prometheus',
     }
 
+    # 正常客戶端常用的服務埠（用於識別 NORMAL_CLIENT_ACTIVITY）
+    COMMON_CLIENT_PORTS = {80, 443, 53, 8080, 8443, 22, 3389}
+
     def __init__(self, es_host: str = "http://localhost:9200"):
         """
         初始化通訊埠分析器
@@ -311,7 +314,10 @@ class PortAnalyzer:
         ephemeral_port_count: int,
         ephemeral_ratio: float,
         perspective: str,
-        flow_count: int = 0
+        flow_count: int = 0,
+        unique_targets: int = 0,
+        common_port_ratio: float = 0.0,
+        top_dst_ports: List[int] = None
     ) -> Dict:
         """
         基於非臨時埠計數法判斷掃描模式
@@ -323,6 +329,9 @@ class PortAnalyzer:
             ephemeral_ratio: 臨時埠比例
             perspective: 'SRC' 或 'DST'
             flow_count: 流量數
+            unique_targets: 不同目標數量（SRC 視角為 unique_dsts）
+            common_port_ratio: 常見客戶端埠流量佔比
+            top_dst_ports: 主要連到的目的埠列表
 
         Returns:
             {
@@ -332,6 +341,9 @@ class PortAnalyzer:
                 'confidence': float
             }
         """
+        if top_dst_ports is None:
+            top_dst_ports = []
+
         # DST 視角（被連線）
         if perspective == 'DST':
             if unique_ports > 20:
@@ -401,3 +413,60 @@ class PortAnalyzer:
                     'reason': 'Below threshold',
                     'confidence': 0.8
                 }
+
+    @staticmethod
+    def check_normal_client_activity(
+        unique_targets: int,
+        service_port_count: int,
+        common_port_ratio: float,
+        top_dst_ports: List[int] = None
+    ) -> Dict:
+        """
+        【新增】檢查是否為正常客戶端行為
+
+        正常客戶端行為特徵：
+        1. 主要連到常見服務埠（80, 443, 53 等）
+        2. 目的埠集中（少量埠，多個目的地）
+        3. 連到多個目的地但埠數適中
+
+        Args:
+            unique_targets: 不同目標數量 (unique_dsts)
+            service_port_count: 服務埠數量 (unique_service_ports)
+            common_port_ratio: 常見客戶端埠流量佔比
+            top_dst_ports: 主要連到的目的埠列表
+
+        Returns:
+            {
+                'is_normal_client': bool,
+                'pattern_type': str,
+                'reason': str,
+                'confidence': float
+            }
+        """
+        if top_dst_ports is None:
+            top_dst_ports = []
+
+        # 條件：
+        # 1. 常見客戶端埠流量佔比 > 50%
+        # 2. 服務埠數量適中 < 30
+        # 3. 連到多個目的地 (unique_targets > 50 代表高度分散)
+        if common_port_ratio > 0.5 and service_port_count < 30 and unique_targets > 50:
+            return {
+                'is_normal_client': True,
+                'pattern_type': 'NORMAL_CLIENT_ACTIVITY',
+                'reason': f'Normal client: {unique_targets} destinations, {common_port_ratio*100:.1f}% common port traffic, {service_port_count} service ports',
+                'confidence': 0.90,
+                'details': {
+                    'unique_destinations': unique_targets,
+                    'common_port_ratio': common_port_ratio,
+                    'service_port_count': service_port_count,
+                    'top_dst_ports': top_dst_ports[:5]
+                }
+            }
+
+        return {
+            'is_normal_client': False,
+            'pattern_type': None,
+            'reason': 'Does not match normal client pattern',
+            'confidence': 0.0
+        }

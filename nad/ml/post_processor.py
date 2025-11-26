@@ -258,6 +258,22 @@ class AnomalyPostProcessor:
                     }
                 }
 
+            # 【新增】NORMAL_CLIENT_ACTIVITY - 正常客戶端行為
+            elif pattern == 'NORMAL_CLIENT_ACTIVITY':
+                return {
+                    'is_false_positive': True,
+                    'reason': 'Normal Client Activity',
+                    'details': {
+                        'pattern': pattern,
+                        'confidence': verification.get('confidence', 0),
+                        'port_analysis': verification.get('port_analysis', {}),
+                        'description': '正常客戶端行為（存取多個 HTTPS/HTTP 服務）',
+                        'evidence': verification.get('reason', 'Normal client activity detected'),
+                        'unique_dsts': verification.get('details', {}).get('unique_dsts', 0),
+                        'unique_dst_ports': verification.get('details', {}).get('unique_dst_ports', 0)
+                    }
+                }
+
             # 確定是誤報
             elif pattern == 'MICROSERVICE_PATTERN':
                 return {
@@ -392,7 +408,27 @@ class AnomalyPostProcessor:
         # 獲取特徵
         features = anomaly.get('features', {})
         unique_dsts = features.get('unique_dsts', 0)
+        unique_dst_ports = features.get('unique_dst_ports', 0)
         avg_bytes = features.get('avg_bytes', 0)
+
+        # 【新增】使用雙向分析器檢查是否為正常客戶端行為
+        verification = self.bi_analyzer.detect_port_scan_improved(src_ip, time_range)
+        pattern = verification.get('pattern', 'UNKNOWN')
+
+        # 如果識別為正常客戶端行為，標記為誤報
+        if pattern == 'NORMAL_CLIENT_ACTIVITY':
+            return {
+                'is_false_positive': True,
+                'reason': 'Normal Client Activity',
+                'details': {
+                    'pattern': pattern,
+                    'confidence': verification.get('confidence', 0.85),
+                    'unique_dsts': unique_dsts,
+                    'unique_dst_ports': unique_dst_ports,
+                    'description': '正常客戶端行為（存取多個 HTTPS/HTTP 服務）',
+                    'evidence': verification.get('reason', 'Normal client activity detected')
+                }
+            }
 
         # 如果是高流量的內網通訊，可能是正常的
         if avg_bytes > 5000 and unique_dsts < 100:
@@ -406,12 +442,26 @@ class AnomalyPostProcessor:
                 }
             }
 
+        # 【新增】如果服務埠數量少於 30，可能是正常的資料收集行為
+        if unique_dst_ports < 30 and unique_dsts > 50:
+            return {
+                'is_false_positive': True,
+                'reason': 'Data Collection or Client Activity',
+                'details': {
+                    'unique_dsts': unique_dsts,
+                    'unique_dst_ports': unique_dst_ports,
+                    'avg_bytes': avg_bytes,
+                    'evidence': f'Limited port diversity ({unique_dst_ports} ports) with many destinations ({unique_dsts})'
+                }
+            }
+
         # 默認保留為 Network Scan
         return {
             'is_false_positive': False,
             'reason': 'Confirmed Network Scan',
             'details': {
                 'unique_dsts': unique_dsts,
+                'unique_dst_ports': unique_dst_ports,
                 'avg_bytes': avg_bytes
             }
         }

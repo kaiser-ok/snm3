@@ -696,6 +696,12 @@ class AnomalyVerifier:
         """
         根據通訊埠特徵自動識別設備角色
 
+        重要語意區分：
+        - DST 視角：分析「被訪問的埠」→ 可判斷「提供什麼服務」（伺服器角色）
+        - SRC 視角：分析「連到的目的埠」→ 只能判斷「正在存取什麼服務」（客戶端行為）
+                   不應用於判斷伺服器角色，否則會誤判
+                   例外：可以透過 src_port 判斷（如伺服器回應流量）
+
         Args:
             port_analysis: 埠分析結果（必須包含 top_ports）
             role: 'src' 或 'dst'
@@ -709,6 +715,13 @@ class AnomalyVerifier:
                 - traffic_ratio: 匹配流量佔比
         """
         if not port_analysis.get('top_ports'):
+            return []
+
+        # 【關鍵修正】SRC 視角不應透過 dst_port 判斷伺服器角色
+        # 因為 SRC 連到 443 代表「存取 HTTPS 服務」，不代表「是 Web 伺服器」
+        if role == 'src':
+            # SRC 視角：僅透過 src_port 判斷是否為伺服器回應流量
+            # 這部分由 _analyze_behavior() 的快速路徑處理
             return []
 
         # 計算總流量（連線數）
@@ -887,32 +900,45 @@ class AnomalyVerifier:
             })
 
         # ========================================
-        # Step 2: 快速路徑 - 伺服器回應流量早期返回
+        # Step 2: 快速路徑 - 伺服器回應流量早期返回（SRC 視角專用）
         # ========================================
-        # 如果是已知的高流量服務（DNS/Web/Mail），且符合典型服務模式，直接返回
-        if role == 'src' and is_known_server:
-            # 檢查是否為伺服器回應模式（來源埠為服務埠）
+        # SRC 視角下，透過 src_port（來源埠）判斷是否為伺服器回應流量
+        # 如果來源埠是服務埠（如 53, 80, 443），代表這台機器是伺服器在回應請求
+        if role == 'src':
+            # 檢查來源埠分布
             src_ports = [f.get('src_port', 0) for f in flows if 'src_port' in f]
             src_port_counter = Counter(src_ports)
-            most_common_src_port = src_port_counter.most_common(1)[0] if src_port_counter else (0, 0)
 
-            # 如果主要來源埠是服務埠（且佔比超過 50%），則為典型服務回應
-            service_port_ratio = most_common_src_port[1] / len(flows) if flows else 0
-            if most_common_src_port[0] < self.EPHEMERAL_PORT_START and service_port_ratio > 0.5:
-                # 添加服務回應標記
-                for r in identified_roles:
-                    if r['role'] in ['DNS_SERVER', 'WEB_SERVER', 'MAIL_SERVER']:
-                        behaviors.append({
-                            'type': f"{r['role']}_RESPONSE",
-                            'severity': 'LOW',
-                            'description': f"{r['desc']}回應流量（源通訊埠 {most_common_src_port[0]}）",
-                            'evidence': {
-                                'responses': most_common_src_port[1],
-                                'percentage': service_port_ratio * 100
-                            }
-                        })
-                        # 服務回應流量不應被標記為掃描
-                        return behaviors
+            # 計算服務埠作為來源的流量佔比
+            service_src_ports = {53: 'DNS', 80: 'HTTP', 443: 'HTTPS', 25: 'SMTP',
+                                 22: 'SSH', 3306: 'MySQL', 5432: 'PostgreSQL'}
+            service_src_count = sum(src_port_counter.get(p, 0) for p in service_src_ports.keys())
+            service_src_ratio = service_src_count / len(flows) if flows else 0
+
+            # 如果超過 50% 的流量來源埠是服務埠，則識別為伺服器回應
+            if service_src_ratio > 0.5:
+                # 找出主要的服務來源埠
+                main_service_ports = [(p, src_port_counter.get(p, 0), service_src_ports[p])
+                                      for p in service_src_ports.keys()
+                                      if src_port_counter.get(p, 0) > 0]
+                main_service_ports.sort(key=lambda x: x[1], reverse=True)
+
+                if main_service_ports:
+                    port, count, service_name = main_service_ports[0]
+                    behaviors.append({
+                        'type': f'{service_name}_SERVER_RESPONSE',
+                        'severity': 'LOW',
+                        'description': f"識別為 {service_name} 伺服器回應流量（來源埠 {port}，佔比 {count/len(flows)*100:.1f}%）",
+                        'evidence': {
+                            'main_src_port': port,
+                            'service': service_name,
+                            'responses': count,
+                            'percentage': count / len(flows) * 100,
+                            'service_src_ratio': service_src_ratio * 100
+                        }
+                    })
+                    # 伺服器回應流量不應被標記為掃描
+                    return behaviors
 
         # ========================================
         # Step 3: 掃描行為檢測（使用角色特徵豁免邏輯）
@@ -1034,8 +1060,46 @@ class AnomalyVerifier:
             ignore_distributed = False
 
             if role == 'src':
-                # SRC 視角：監控/管理類角色豁免 NETWORK_SCANNING
-                if is_management:
+                # SRC 視角：判斷是「正常客戶端行為」還是「網路掃描」
+                #
+                # 正常客戶端行為特徵：
+                # 1. 主要連到常見服務埠（80, 443, 53 等）
+                # 2. 目的埠集中（少量埠，多個目的地）
+                # 3. 每個連線有正常流量（非探測性的小封包）
+                #
+                # 網路掃描特徵：
+                # 1. 連到大量不同埠（埠掃描）
+                # 2. 連到大量不同 IP + 相同埠（主機發現）
+                # 3. 小流量探測封包
+
+                # 檢查目的埠是否集中在常見服務
+                common_client_ports = {80, 443, 53, 8080, 8443, 22, 3389}
+                top_dst_ports = [p['port'] for p in port_analysis['top_ports'][:5]]
+                common_port_hits = len(set(top_dst_ports) & common_client_ports)
+
+                # 計算常見服務埠的流量佔比
+                common_port_traffic = sum(p['count'] for p in port_analysis['top_ports']
+                                         if p['port'] in common_client_ports)
+                total_traffic = port_analysis['total_connections']
+                common_port_ratio = common_port_traffic / total_traffic if total_traffic > 0 else 0
+
+                # 如果主要連到常見服務埠（>50%），且服務埠數量適中（<30），視為正常客戶端
+                # 原本條件太嚴格（>60%, <10），放寬到 (>50%, <30) 以涵蓋更多正常客戶端場景
+                if common_port_ratio > 0.5 and port_analysis['unique_service_ports'] < 30:
+                    behaviors.append({
+                        'type': 'NORMAL_CLIENT_ACTIVITY',
+                        'severity': 'LOW',
+                        'description': f"正常客戶端行為：連到 {dst_analysis['unique_destinations']} 個目的地，主要存取 {', '.join(map(str, top_dst_ports[:3]))} 等服務",
+                        'evidence': {
+                            'unique_destinations': dst_analysis['unique_destinations'],
+                            'common_port_ratio': common_port_ratio * 100,
+                            'unique_service_ports': port_analysis['unique_service_ports'],
+                            'top_dst_ports': top_dst_ports
+                        }
+                    })
+                    ignore_distributed = True
+                # 監控/管理類角色豁免 NETWORK_SCANNING
+                elif is_management:
                     role_desc = ', '.join([r['desc'] for r in identified_roles if r['role'] in management_roles])
                     behaviors.append({
                         'type': 'MANAGEMENT_MULTI_TARGET',
@@ -1159,13 +1223,24 @@ class AnomalyVerifier:
         low_severity_types = [b['type'] for b in behaviors if b['severity'] == 'LOW']
 
         # 服務器回應流量應該被視為誤報
-        if any(t in ['DNS_SERVER_RESPONSE', 'WEB_SERVER_RESPONSE', 'NORMAL_SERVICE', 'HYBRID_SERVER_CLIENT', 'SERVER_RESPONSE_TO_CLIENTS', 'DATA_COLLECTION', 'MULTI_SERVICE_HOST'] for t in low_severity_types):
+        # 新增的 SERVER_RESPONSE 類型（來自 Step 2 快速路徑）
+        server_response_types = [t for t in low_severity_types if t.endswith('_SERVER_RESPONSE')]
+
+        if any(t in ['DNS_SERVER_RESPONSE', 'WEB_SERVER_RESPONSE', 'NORMAL_SERVICE', 'HYBRID_SERVER_CLIENT',
+                     'SERVER_RESPONSE_TO_CLIENTS', 'DATA_COLLECTION', 'MULTI_SERVICE_HOST',
+                     'NORMAL_CLIENT_ACTIVITY'] for t in low_severity_types) or server_response_types:
             verdict = 'FALSE_POSITIVE'
             confidence = 'HIGH'
-            if 'DNS_SERVER_RESPONSE' in low_severity_types:
+            if server_response_types:
+                # 處理新的 *_SERVER_RESPONSE 類型（如 HTTPS_SERVER_RESPONSE）
+                service_name = server_response_types[0].replace('_SERVER_RESPONSE', '')
+                recommendation = f'這是 {service_name} 伺服器回應流量，建議調整 Transform 或特徵工程來排除服務器回應'
+            elif 'DNS_SERVER_RESPONSE' in low_severity_types:
                 recommendation = '這是 DNS 服務器回應流量，建議調整 Transform 或特徵工程來排除服務器回應'
             elif 'WEB_SERVER_RESPONSE' in low_severity_types:
                 recommendation = '這是 Web 服務器回應流量，建議調整 Transform 或特徵工程來排除服務器回應'
+            elif 'NORMAL_CLIENT_ACTIVITY' in low_severity_types:
+                recommendation = '這是正常的客戶端行為（存取多個 HTTPS/HTTP 服務），建議調整特徵閾值'
             elif 'DATA_COLLECTION' in low_severity_types:
                 recommendation = '這是正常的資料收集行為（如 WHOIS 查詢、API 調用），建議調整特徵閾值'
             elif 'MULTI_SERVICE_HOST' in low_severity_types:
@@ -1220,6 +1295,14 @@ class AnomalyVerifier:
             low_severity_types.extend([b['type'] for b in dst_behaviors if b['severity'] == 'LOW'])
 
         # 綜合判斷
+        # 檢測新的 *_SERVER_RESPONSE 類型
+        server_response_types = [t for t in low_severity_types if t.endswith('_SERVER_RESPONSE')]
+
+        # 正常行為類型清單
+        normal_behavior_types = ['DNS_SERVER_RESPONSE', 'WEB_SERVER_RESPONSE', 'NORMAL_SERVICE',
+                                 'HYBRID_SERVER_CLIENT', 'SERVER_RESPONSE_TO_CLIENTS',
+                                 'DATA_COLLECTION', 'MULTI_SERVICE_HOST', 'NORMAL_CLIENT_ACTIVITY']
+
         if high_severity_count > 0:
             verdict = 'TRUE_ANOMALY'
             confidence = 'HIGH'
@@ -1227,12 +1310,18 @@ class AnomalyVerifier:
                 recommendation = f'檢測到 {high_severity_count} 個高危異常行為，建議立即調查'
             else:
                 recommendation = '檢測到高危異常行為，建議立即調查'
-        elif any(t in ['DNS_SERVER_RESPONSE', 'WEB_SERVER_RESPONSE', 'NORMAL_SERVICE', 'HYBRID_SERVER_CLIENT', 'SERVER_RESPONSE_TO_CLIENTS', 'DATA_COLLECTION', 'MULTI_SERVICE_HOST'] for t in low_severity_types):
+        elif any(t in normal_behavior_types for t in low_severity_types) or server_response_types:
             # 如果有高危行為，不應該被服務器回應掩蓋
             if high_severity_count == 0:
                 verdict = 'FALSE_POSITIVE'
                 confidence = 'HIGH'
-                recommendation = '主要為正常服務流量（資料收集、多服務主機或伺服器回應），建議調整特徵閾值'
+                # 根據具體類型提供更精確的建議
+                if 'NORMAL_CLIENT_ACTIVITY' in low_severity_types:
+                    recommendation = '主要為正常客戶端行為（存取多個 HTTPS/HTTP 服務），建議調整特徵閾值'
+                elif server_response_types:
+                    recommendation = '主要為伺服器回應流量，建議調整特徵閾值'
+                else:
+                    recommendation = '主要為正常服務流量（資料收集、多服務主機或伺服器回應），建議調整特徵閾值'
             else:
                 verdict = 'MIXED'
                 confidence = 'MEDIUM'
