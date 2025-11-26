@@ -159,13 +159,19 @@ class DualModelAnomalyDetector:
                 # Src 視角分類
                 classification = self.classifier.classify(
                     features=anomaly['features'],
-                    context={'src_ip': anomaly['src_ip']}
+                    context={
+                        'src_ip': anomaly['src_ip'],
+                        'time_bucket': anomaly.get('time_bucket')
+                    }
                 )
             else:
                 # Dst 視角分類
                 classification = self.classifier.classify_dst(
                     features=anomaly['features'],
-                    context={'dst_ip': anomaly['dst_ip']}
+                    context={
+                        'dst_ip': anomaly['dst_ip'],
+                        'time_bucket': anomaly.get('time_bucket')
+                    }
                 )
 
             classified_anomalies.append({

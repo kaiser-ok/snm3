@@ -16,10 +16,32 @@
 """
 
 import numpy as np
-from datetime import datetime
-from typing import Dict, List, Tuple
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple, Optional
+from functools import lru_cache
+from collections import OrderedDict
+import threading
 import yaml
 import os
+import requests
+import json
+import logging
+
+# 設定 post_process logger
+post_process_logger = logging.getLogger('post_process')
+post_process_logger.setLevel(logging.INFO)
+
+# 確保 logs 目錄存在並設定 FileHandler
+_log_dir = '/home/kaisermac/snm_flow/nad/logs'
+os.makedirs(_log_dir, exist_ok=True)
+_log_file = os.path.join(_log_dir, 'post_process.log')
+
+# 只在沒有 handler 時添加
+if not any(isinstance(h, logging.FileHandler) and h.baseFilename == _log_file for h in post_process_logger.handlers):
+    _fh = logging.FileHandler(_log_file, encoding='utf-8')
+    _fh.setLevel(logging.INFO)
+    _fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    post_process_logger.addHandler(_fh)
 
 
 # 威脅類別定義
@@ -286,6 +308,44 @@ THREAT_CLASSES = {
         ],
         'response': ['確認掃描行為是否授權', '檢查掃描來源主機', '記錄掃描活動'],
         'auto_action': 'MONITOR'
+    },
+    'NORMAL_DST_TRAFFIC': {
+        'name': '正常目的地流量',
+        'name_en': 'Normal Destination Traffic',
+        'severity': 'LOW',
+        'priority': 'P3',
+        'description': '正常的點對點通訊或少量來源的服務訪問',
+        'indicators': [
+            '少量來源 IP（1-3 個）',
+            '正常封包大小',
+            '適中的連線數量',
+            '內部 IP 通訊'
+        ],
+        'response': [
+            '加入白名單',
+            '調整異常檢測閾值',
+            '持續監控確認為正常行為'
+        ],
+        'auto_action': 'WHITELIST'
+    },
+    'SERVER_RESPONSE_TRAFFIC': {
+        'name': '伺服器回應流量',
+        'name_en': 'Server Response Traffic',
+        'severity': 'LOW',
+        'priority': 'P3',
+        'description': '伺服器回應到客戶端的正常流量（DST 視角的大量埠是回應到臨時埠）',
+        'indicators': [
+            'SRC 視角主要連到知名服務埠（SNMP/DNS/HTTP 等）',
+            'SRC 視角使用大量來源埠（每次查詢用不同臨時埠）',
+            'DST 視角的大量目的埠是回應流量',
+            '跨視角分析確認為伺服器行為'
+        ],
+        'response': [
+            '加入白名單',
+            '這是正常的伺服器回應流量',
+            '無需處理'
+        ],
+        'auto_action': 'WHITELIST'
     }
 }
 
@@ -297,15 +357,19 @@ class AnomalyClassifier:
     使用規則型方法對 Isolation Forest 檢測出的異常進行分類
     """
 
-    def __init__(self, config=None):
+    def __init__(self, config=None, es_host: str = None):
         """
         初始化分類器
 
         Args:
             config: 配置對象
+            es_host: Elasticsearch 連線 URL（用於跨視角查詢）
         """
         self.config = config
         self.threat_classes = THREAT_CLASSES
+
+        # ES 連線設定（從環境變數或參數取得）
+        self.es_host = es_host or os.environ.get('ES_HOST', 'http://localhost:9200')
 
         # 載入 classifier 閾值配置
         self.thresholds_config = self._load_classifier_thresholds()
@@ -324,6 +388,30 @@ class AnomalyClassifier:
         # 備份時間窗口（從配置讀取，預設凌晨 1-5 點）
         backup_hours_list = self.global_config.get('backup_hours', [1, 2, 3, 4, 5])
         self.backup_hours = range(min(backup_hours_list), max(backup_hours_list) + 1) if backup_hours_list else range(1, 6)
+
+        # ===== SRC 視角檢查結果快取 =====
+        # 用於避免重複查詢相同 IP 的 SRC 視角資料
+        # key: (dst_ip, time_bucket_rounded)  -> 將時間桶捨入到 10 分鐘
+        # value: {'result': 'SERVER_RESPONSE' | 'NOT_SERVER' | 'NO_DATA', 'timestamp': datetime}
+        self._src_check_cache = OrderedDict()
+        self._src_check_cache_lock = threading.Lock()
+
+        # 從 config 讀取快取設定
+        cache_config = self.thresholds_config.get('src_check_cache', {})
+        self._src_check_cache_max_size = cache_config.get('max_size', 500)
+        self._src_check_cache_ttl = cache_config.get('ttl_seconds', 1200)  # 預設 20 分鐘
+
+        # 快取統計
+        self._cache_stats = {
+            'hits': 0,
+            'misses': 0,
+            'expired': 0
+        }
+
+        # 定期 log 統計的設定
+        self._last_stats_log_time = datetime.now()
+        self._stats_log_interval = cache_config.get('stats_log_interval', 300)  # 預設 5 分鐘
+        self._last_logged_stats = {'hits': 0, 'misses': 0}  # 記錄上次 log 時的數值
 
     def _load_classifier_thresholds(self) -> Dict:
         """載入 classifier 閾值配置"""
@@ -518,6 +606,9 @@ class AnomalyClassifier:
         # Port 相關特徵
         top_dst_port_concentration = features.get('top_dst_port_concentration', 0)
 
+        # ✅ Phase 1: 連續端口檢測特徵
+        has_sequential = features.get('has_sequential_dst_ports', 0)
+
         # 從配置讀取閾值，如果沒有配置則使用預設值
         config = self.src_thresholds.get('PORT_SCAN', {})
         if not config.get('enabled', True):
@@ -528,12 +619,17 @@ class AnomalyClassifier:
         threshold_bytes = thresholds.get('avg_bytes', 5000)
         threshold_diversity = thresholds.get('dst_port_diversity', 0.5)
 
-        # 埠掃描特徵：
+        # ✅ 快速路徑：連續端口掃描（如 1-1024）是明顯的掃描行為
+        # 即使不滿足其他條件，只要是連續掃描大量端口就判定為掃描
+        if has_sequential == 1 and unique_dst_ports > 50:
+            return True
+
+        # 埠掃描特徵（標準判斷）：
         # 1. 掃描大量埠
         # 2. 小封包
         # 3. 埠高度分散
-        # 4. 【新增】目標主機少（專注於少數目標的端口掃描）
-        # 5. 【新增】端口流量分散（沒有集中在特定端口）
+        # 4. 目標主機少（專注於少數目標的端口掃描）
+        # 5. 端口流量分散（沒有集中在特定端口）
         return (
             unique_dst_ports > threshold_ports and
             avg_bytes < threshold_bytes and
@@ -664,6 +760,10 @@ class AnomalyClassifier:
         dst_well_known_ratio = features.get('dst_well_known_ratio', 0)
         common_ports_ratio = features.get('common_ports_ratio', 0)
 
+        # ✅ Phase 2: 註冊端口比例（數據外洩常用非標準端口規避檢測）
+        dst_registered_ratio = features.get('dst_registered_ratio', 0)
+        dst_ephemeral_ratio = features.get('dst_ephemeral_ratio', 0)
+
         # 從配置讀取閾值
         config = self.src_thresholds.get('DATA_EXFILTRATION', {})
         if not config.get('enabled', True):
@@ -678,15 +778,19 @@ class AnomalyClassifier:
         # 檢查是否有外部 IP
         has_external = any(not self._is_internal_ip(ip) for ip in dst_ips) if dst_ips else False
 
-        # 【新增】使用非標準端口（規避檢測的常見手法）
-        uses_non_standard_ports = (common_ports_ratio < 0.3)  # 少於 30% 使用標準端口
+        # ✅ Phase 2: 使用非標準端口（規避檢測的常見手法）
+        # 註冊端口（1024-49151）或臨時端口（49152-65535）比例高，知名端口比例低
+        uses_non_standard_ports = (
+            (dst_registered_ratio > 0.5 or dst_ephemeral_ratio > 0.3) and
+            dst_well_known_ratio < 0.3
+        )
 
         # 數據外洩特徵：
         # 1. 大流量或高傳輸速率
         # 2. 目的地極少
         # 3. 目的地集中
         # 4. 有外部 IP
-        # 5. 【新增】可能使用非標準端口（提高置信度）
+        # 5. ✅ Phase 2: 使用非標準端口（提高置信度）
         basic_exfil = (
             (total_bytes > threshold_bytes or byte_rate > threshold_rate) and
             unique_dsts <= threshold_dsts and
@@ -694,8 +798,8 @@ class AnomalyClassifier:
             has_external
         )
 
-        # 如果使用非標準端口，更可疑
-        return basic_exfil
+        # ✅ Phase 2: 如果使用非標準端口，更可疑（強化檢測）
+        return basic_exfil and uses_non_standard_ports
 
     def _is_c2_communication(self, features: Dict, context: Dict) -> bool:
         """判斷是否為 C&C 通訊"""
@@ -706,6 +810,10 @@ class AnomalyClassifier:
         # Port 相關特徵
         unique_dst_ports = features.get('unique_dst_ports', 0)
         common_ports_ratio = features.get('common_ports_ratio', 0)
+
+        # ✅ Phase 2: 臨時端口比例（C&C 通常使用註冊或動態端口）
+        dst_ephemeral_ratio = features.get('dst_ephemeral_ratio', 0)
+        dst_registered_ratio = features.get('dst_registered_ratio', 0)
 
         # 從配置讀取閾值
         config = self.src_thresholds.get('C2_COMMUNICATION', {})
@@ -719,28 +827,54 @@ class AnomalyClassifier:
         threshold_bytes_min = thresholds.get('avg_bytes_min', 1000)
         threshold_bytes_max = thresholds.get('avg_bytes_max', 100000)
 
-        # 【新增】C&C 常用高端口號 (> 1024) 或非標準端口
+        # C&C 常用高端口號或非標準端口（規避檢測）
         uses_high_ports = (common_ports_ratio < 0.5)  # 少於 50% 使用標準端口
+
+        # ✅ C&C 通常使用註冊端口（1024-49151）或動態端口（49152-65535）
+        # 如果主要使用這些端口，增加 C&C 可能性
+        uses_non_well_known = (dst_registered_ratio > 0.5 or dst_ephemeral_ratio > 0.5)
 
         # C&C 通訊特徵：
         # 1. 單一目的地
         # 2. 中等連線數
         # 3. 中等流量
-        # 4. 週期性（需要時間序列分析，這裡簡化）
-        # 5. 【新增】通常使用少數端口（1-3個）
-        # 6. 【新增】可能使用非標準端口（規避檢測）
-        return (
+        # 4. 通常使用少數端口（1-3個）
+        # 5. ✅ 使用非知名端口（註冊或動態端口，規避檢測）
+        basic_c2_pattern = (
             unique_dsts == threshold_dsts and
             threshold_flow_min < flow_count < threshold_flow_max and
             threshold_bytes_min < avg_bytes < threshold_bytes_max and
-            unique_dst_ports <= 3  # C&C 通常只用少數端口
+            unique_dst_ports <= 3
         )
+
+        # 如果符合基本模式且使用非知名端口，判定為 C&C
+        return basic_c2_pattern and uses_non_well_known
 
     def _is_normal_high_traffic(self, features: Dict, dst_ips: List[str], timestamp) -> bool:
         """判斷是否為正常高流量"""
         total_bytes = features.get('total_bytes', 0)
         unique_dsts = features.get('unique_dsts', 0)
         is_likely_server = features.get('is_likely_server_response', 0)
+
+        # ✅ Phase 1: Server 角色識別特徵
+        is_web_server = features.get('is_likely_web_server', 0)
+        is_dns_server = features.get('is_likely_dns_server', 0)
+        is_db_server = features.get('is_likely_db_server', 0)
+        is_mail_server = features.get('is_likely_mail_server', 0)
+
+        # 明確識別為已知服務器類型
+        is_known_server = any([
+            is_web_server == 1,
+            is_dns_server == 1,
+            is_db_server == 1,
+            is_mail_server == 1
+        ])
+
+        # ✅ Phase 2: 臨時端口比例檢查（服務器回應特徵）
+        dst_ephemeral_ratio = features.get('dst_ephemeral_ratio', 0)
+        # 如果回應到大量臨時端口（> 80%），這是典型的服務器回應客戶端模式
+        # 與 verify_anomaly.py 的 ephemeral_ratio > 0.9 邏輯一致（但稍微寬鬆）
+        is_server_response_pattern = (dst_ephemeral_ratio > 0.8)
 
         # 從配置讀取閾值
         config = self.src_thresholds.get('NORMAL_HIGH_TRAFFIC', {})
@@ -761,12 +895,15 @@ class AnomalyClassifier:
 
         # 正常高流量特徵：
         # 1. 大流量但目標是內網
-        # 2. 或者是服務器回應流量
-        # 3. 或者在備份時間
-        # 4. 目的地數量合理（不是單一也不是太分散）
+        # 2. 或者是服務器回應流量（原有判斷）
+        # 3. ✅ 或者是已知服務器類型（Web/DNS/DB/Mail）
+        # 4. ✅ 或者有服務器回應模式（回應到大量臨時端口）
+        # 5. 或者在備份時間
+        # 6. 目的地數量合理（不是單一也不是太分散）
         return (
             total_bytes > threshold_bytes and
-            (all_internal or is_likely_server == 1 or is_backup_time) and
+            (all_internal or is_likely_server == 1 or is_known_server or
+             is_server_response_pattern or is_backup_time) and
             threshold_dsts_min < unique_dsts < threshold_dsts_max
         )
 
@@ -778,7 +915,14 @@ class AnomalyClassifier:
         dst_port_diversity = features.get('dst_port_diversity', 0)
         avg_bytes = features.get('avg_bytes', 0)
 
+        # ✅ Phase 1: 連續端口檢測特徵
+        has_sequential = features.get('has_sequential_dst_ports', 0)
+
         confidence = 0.6  # 基礎置信度
+
+        # ✅ 連續端口掃描是非常明顯的特徵
+        if has_sequential == 1:
+            confidence += 0.2  # 連續掃描（如 1-1024）
 
         # 埠數量越多，置信度越高
         if unique_dst_ports > 1000:
@@ -925,6 +1069,17 @@ class AnomalyClassifier:
         if is_likely_server == 1:
             confidence += 0.3
 
+        # ✅ Phase 1: 明確識別為已知服務器類型
+        is_known_server = any([
+            features.get('is_likely_web_server', 0) == 1,
+            features.get('is_likely_dns_server', 0) == 1,
+            features.get('is_likely_db_server', 0) == 1,
+            features.get('is_likely_mail_server', 0) == 1
+        ])
+
+        if is_known_server:
+            confidence += 0.25  # 明確的服務器類型識別，高置信度
+
         # 都是內部 IP
         if dst_ips and all(self._is_internal_ip(ip) for ip in dst_ips):
             confidence += 0.2
@@ -943,6 +1098,328 @@ class AnomalyClassifier:
         if not ip:
             return False
         return any(ip.startswith(prefix) for prefix in self.internal_networks)
+
+    # ========== SRC 視角檢查快取方法 ==========
+
+    def _round_time_bucket(self, time_bucket: str) -> str:
+        """
+        將時間桶捨入到 10 分鐘，用於快取 key
+        例如: 2025-11-26T15:07:00.000Z -> 2025-11-26T15:00:00Z
+        """
+        try:
+            if isinstance(time_bucket, str):
+                dt = datetime.fromisoformat(time_bucket.replace('Z', '+00:00'))
+            else:
+                dt = time_bucket
+
+            # 移除時區資訊
+            if dt.tzinfo:
+                dt = dt.replace(tzinfo=None)
+
+            # 捨入到 10 分鐘
+            rounded_minute = (dt.minute // 10) * 10
+            rounded_dt = dt.replace(minute=rounded_minute, second=0, microsecond=0)
+            return rounded_dt.strftime('%Y-%m-%dT%H:%M:00Z')
+        except Exception:
+            return time_bucket
+
+    def _get_cache_key(self, dst_ip: str, time_bucket: str) -> str:
+        """生成快取 key"""
+        rounded_time = self._round_time_bucket(time_bucket)
+        return f"{dst_ip}|{rounded_time}"
+
+    def _check_src_cache(self, dst_ip: str, time_bucket: str) -> Optional[Dict]:
+        """
+        檢查快取中是否有此 IP 的 SRC 視角檢查結果
+
+        Returns:
+            快取的結果，如果未命中或已過期則返回 None
+        """
+        cache_key = self._get_cache_key(dst_ip, time_bucket)
+
+        with self._src_check_cache_lock:
+            if cache_key in self._src_check_cache:
+                cached = self._src_check_cache[cache_key]
+                age = (datetime.now() - cached['timestamp']).total_seconds()
+
+                if age < self._src_check_cache_ttl:
+                    # 快取命中且未過期
+                    self._cache_stats['hits'] += 1
+                    # 移到最後（LRU）
+                    self._src_check_cache.move_to_end(cache_key)
+                    return cached
+                else:
+                    # 快取已過期
+                    self._cache_stats['expired'] += 1
+                    del self._src_check_cache[cache_key]
+
+            self._cache_stats['misses'] += 1
+            return None
+
+    def _update_src_cache(self, dst_ip: str, time_bucket: str, result: str,
+                          src_features: Optional[Dict] = None):
+        """
+        更新快取
+
+        Args:
+            dst_ip: 目的地 IP
+            time_bucket: 時間桶
+            result: 檢查結果 ('SERVER_RESPONSE' | 'NOT_SERVER' | 'NO_DATA')
+            src_features: SRC 視角的特徵資料（可選）
+        """
+        cache_key = self._get_cache_key(dst_ip, time_bucket)
+
+        with self._src_check_cache_lock:
+            # 如果快取已滿，移除最舊的項目
+            while len(self._src_check_cache) >= self._src_check_cache_max_size:
+                self._src_check_cache.popitem(last=False)
+
+            self._src_check_cache[cache_key] = {
+                'result': result,
+                'src_features': src_features,
+                'timestamp': datetime.now()
+            }
+
+    def get_cache_stats(self) -> Dict:
+        """獲取快取統計資訊"""
+        with self._src_check_cache_lock:
+            total = self._cache_stats['hits'] + self._cache_stats['misses']
+            hit_rate = self._cache_stats['hits'] / total if total > 0 else 0
+
+            return {
+                'hits': self._cache_stats['hits'],
+                'misses': self._cache_stats['misses'],
+                'expired': self._cache_stats['expired'],
+                'hit_rate': f"{hit_rate:.1%}",
+                'cache_size': len(self._src_check_cache),
+                'max_size': self._src_check_cache_max_size,
+                'ttl_seconds': self._src_check_cache_ttl
+            }
+
+    def clear_cache(self):
+        """清除快取"""
+        with self._src_check_cache_lock:
+            self._src_check_cache.clear()
+            self._cache_stats = {'hits': 0, 'misses': 0, 'expired': 0}
+            self._last_logged_stats = {'hits': 0, 'misses': 0}
+
+    def _maybe_log_cache_stats(self):
+        """
+        定期輸出快取統計到 log
+        每隔 stats_log_interval 秒輸出一次
+        """
+        now = datetime.now()
+        elapsed = (now - self._last_stats_log_time).total_seconds()
+
+        if elapsed >= self._stats_log_interval:
+            with self._src_check_cache_lock:
+                total = self._cache_stats['hits'] + self._cache_stats['misses']
+                hit_rate = self._cache_stats['hits'] / total if total > 0 else 0
+
+                # 計算這個區間的增量
+                interval_hits = self._cache_stats['hits'] - self._last_logged_stats['hits']
+                interval_misses = self._cache_stats['misses'] - self._last_logged_stats['misses']
+                interval_total = interval_hits + interval_misses
+                interval_hit_rate = interval_hits / interval_total if interval_total > 0 else 0
+
+                post_process_logger.info(
+                    f"[CACHE_STATS] interval={int(elapsed)}s, "
+                    f"interval_hits={interval_hits}, interval_misses={interval_misses}, "
+                    f"interval_hit_rate={interval_hit_rate:.1%}, "
+                    f"total_hits={self._cache_stats['hits']}, total_misses={self._cache_stats['misses']}, "
+                    f"total_hit_rate={hit_rate:.1%}, cache_size={len(self._src_check_cache)}, "
+                    f"expired={self._cache_stats['expired']}"
+                )
+
+                # 更新上次 log 的時間和數值
+                self._last_stats_log_time = now
+                self._last_logged_stats = {
+                    'hits': self._cache_stats['hits'],
+                    'misses': self._cache_stats['misses']
+                }
+
+    def _fetch_src_perspective(self, ip: str, time_bucket: str) -> Optional[Dict]:
+        """
+        從 ES 查詢 SRC 視角的資料
+
+        當分析 DST 視角異常時，可以透過這個方法查詢同一 IP 的 SRC 視角資料，
+        以判斷該 IP 是否實際上是一個伺服器正在回應客戶端請求。
+
+        Args:
+            ip: 目的地 IP（在 SRC 視角中就是 src_ip）
+            time_bucket: 時間桶（ISO 格式）
+
+        Returns:
+            SRC 視角的特徵資料，如果查無資料則返回 None
+        """
+        try:
+            # 解析時間桶，設定 ±6 分鐘的時間容錯
+            if isinstance(time_bucket, str):
+                bucket_time = datetime.fromisoformat(time_bucket.replace('Z', '+00:00'))
+            else:
+                bucket_time = time_bucket
+
+            # 移除時區資訊以便計算
+            if bucket_time.tzinfo:
+                bucket_time = bucket_time.replace(tzinfo=None)
+
+            time_start = (bucket_time - timedelta(minutes=6)).isoformat() + 'Z'
+            time_end = (bucket_time + timedelta(minutes=6)).isoformat() + 'Z'
+
+            # 查詢 SRC 視角資料
+            query = {
+                "size": 1,
+                "query": {
+                    "bool": {
+                        "must": [
+                            {"term": {"src_ip": ip}},
+                            {"range": {"time_bucket": {"gte": time_start, "lte": time_end}}}
+                        ]
+                    }
+                },
+                "sort": [{"time_bucket": {"order": "desc"}}]
+            }
+
+            url = f"{self.es_host}/netflow_stats_3m_by_src/_search"
+            response = requests.post(
+                url,
+                json=query,
+                headers={"Content-Type": "application/json"},
+                timeout=5
+            )
+
+            if response.status_code != 200:
+                return None
+
+            result = response.json()
+            hits = result.get('hits', {}).get('hits', [])
+
+            if not hits:
+                return None
+
+            return hits[0].get('_source', {})
+
+        except Exception as e:
+            # 查詢失敗時靜默返回 None，不影響主流程
+            return None
+
+    def _is_server_response_traffic(self, dst_features: Dict, src_features: Dict) -> bool:
+        """
+        判斷 DST 視角的流量是否實際上是伺服器回應流量
+
+        這個方法比對 DST 和 SRC 視角的特徵，識別以下模式：
+        - SRC 視角：IP 作為客戶端，連接到知名服務埠（如 161, 53, 80）
+        - DST 視角：同一 IP 收到大量不同埠的流量（這些是回應到客戶端的臨時埠）
+
+        典型案例：
+        - SNMP 伺服器：SRC 連到 port 161，DST 收到回應
+        - DNS 伺服器：SRC 連到 port 53，DST 收到回應
+        - Web 伺服器：SRC 連到 port 80/443，DST 收到回應
+
+        Args:
+            dst_features: DST 視角的特徵
+            src_features: SRC 視角的特徵
+
+        Returns:
+            True 如果這是伺服器回應流量
+        """
+        # 臨時埠起始值（>32000 視為臨時埠）
+        EPHEMERAL_PORT_START = 32000
+
+        # 知名服務埠（擴展列表）
+        well_known_service_ports = {
+            161, 162,  # SNMP
+            53,        # DNS
+            80, 443, 8080, 8443,  # HTTP/HTTPS
+            22,        # SSH
+            23,        # Telnet
+            25, 110, 143, 465, 587, 993, 995,  # Mail
+            389, 636, 3268,  # LDAP/AD
+            88,        # Kerberos
+            3306,      # MySQL
+            5432,      # PostgreSQL
+            6379,      # Redis
+            27017,     # MongoDB
+            1514,      # Syslog/SIEM
+            5601,      # Kibana
+            9200, 9300,  # Elasticsearch
+            5173,      # Vite dev server
+            60022,     # Custom SSH
+            445, 139,  # SMB
+            123,       # NTP
+        }
+
+        # ===== 方法 1: 檢查 DST 視角的臨時埠比例 =====
+        # 如果 DST 被訪問的埠大部分是臨時埠（>32000），說明這是伺服器回應流量
+        dst_top_dst_ports = dst_features.get('top_dst_ports', {})
+        if isinstance(dst_top_dst_ports, str):
+            try:
+                dst_top_dst_ports = json.loads(dst_top_dst_ports)
+            except:
+                dst_top_dst_ports = {}
+
+        if dst_top_dst_ports:
+            total_dst_flows = sum(dst_top_dst_ports.values())
+            ephemeral_flows = sum(
+                count for port, count in dst_top_dst_ports.items()
+                if int(port) > EPHEMERAL_PORT_START
+            )
+            ephemeral_ratio = ephemeral_flows / total_dst_flows if total_dst_flows > 0 else 0
+
+            # 如果 90% 以上的流量是到臨時埠，這是典型的伺服器回應流量
+            if ephemeral_ratio > 0.9:
+                post_process_logger.debug(
+                    f"[SERVER_RESPONSE_CHECK] ephemeral_ratio={ephemeral_ratio:.2f} > 0.9, "
+                    f"detected as server response by ephemeral port ratio"
+                )
+                return True
+
+        # ===== 方法 2: 檢查 SRC 視角是否連到知名服務埠 =====
+        src_top_dst_ports = src_features.get('top_dst_ports', {})
+        if isinstance(src_top_dst_ports, str):
+            try:
+                src_top_dst_ports = json.loads(src_top_dst_ports)
+            except:
+                src_top_dst_ports = {}
+
+        if not src_top_dst_ports:
+            return False
+
+        # 計算連到知名服務埠的比例
+        total_flows = sum(src_top_dst_ports.values())
+        well_known_flows = sum(
+            count for port, count in src_top_dst_ports.items()
+            if int(port) in well_known_service_ports
+        )
+
+        if total_flows == 0:
+            return False
+
+        well_known_ratio = well_known_flows / total_flows
+
+        # 取得 DST 視角的特徵
+        dst_unique_dst_ports = dst_features.get('unique_dst_ports', 0)
+        dst_flow_count = dst_features.get('flow_count', 0)
+        port_to_flow_ratio = dst_unique_dst_ports / max(dst_flow_count, 1)
+
+        # 伺服器回應流量的特徵：
+        # 1. SRC 視角主要連到知名服務埠（> 50%）
+        # 2. DST 視角有大量不同的目的埠（這些是臨時埠）
+        # 3. DST 視角的埠數量相對於連線數很高（每個連線用不同埠）
+        is_server_response = (
+            well_known_ratio > 0.5 and
+            dst_unique_dst_ports > 20 and
+            port_to_flow_ratio > 0.3
+        )
+
+        # 記錄判斷細節
+        post_process_logger.debug(
+            f"[SERVER_RESPONSE_CHECK] well_known_ratio={well_known_ratio:.2f}, "
+            f"dst_unique_ports={dst_unique_dst_ports}, dst_flow_count={dst_flow_count}, "
+            f"port_to_flow_ratio={port_to_flow_ratio:.2f}, is_server_response={is_server_response}"
+        )
+
+        return is_server_response
 
     def _create_classification(self, class_name: str, confidence: float,
                               features: Dict, context: Dict) -> Dict:
@@ -988,9 +1465,16 @@ class AnomalyClassifier:
             avg_bytes = features.get('avg_bytes', 0)
             dst_port_diversity = features.get('dst_port_diversity', 0)
 
+            # ✅ Phase 1: 連續端口檢測
+            has_sequential = features.get('has_sequential_dst_ports', 0)
+
             indicators.append(f"掃描 {unique_dst_ports:,} 個不同埠")
             indicators.append(f"平均封包 {avg_bytes:,.0f} bytes（小封包）")
             indicators.append(f"埠分散度 {dst_port_diversity:.2f}（高度分散）")
+
+            # ✅ 如果是連續掃描，添加明確指標
+            if has_sequential == 1:
+                indicators.append("檢測到連續端口掃描模式（如 1-1024）")
 
         elif class_name == 'NETWORK_SCAN':
             unique_dsts = features.get('unique_dsts', 0)
@@ -1019,6 +1503,17 @@ class AnomalyClassifier:
             if external_ips:
                 indicators.append(f"目標外部 IP: {', '.join(external_ips[:3])}")
 
+            # ✅ Phase 2: 端口類型信息
+            dst_registered_ratio = features.get('dst_registered_ratio', 0)
+            dst_ephemeral_ratio = features.get('dst_ephemeral_ratio', 0)
+            dst_well_known_ratio = features.get('dst_well_known_ratio', 0)
+            if dst_registered_ratio > 0.5:
+                indicators.append(f"使用註冊端口 {dst_registered_ratio*100:.1f}%（可能規避檢測）")
+            elif dst_ephemeral_ratio > 0.3:
+                indicators.append(f"使用臨時端口 {dst_ephemeral_ratio*100:.1f}%（非標準通訊）")
+            if dst_well_known_ratio < 0.3:
+                indicators.append("較少使用知名服務端口")
+
         elif class_name == 'DNS_TUNNELING':
             flow_count = features.get('flow_count', 0)
             indicators.append(f"{flow_count:,} 次 DNS 查詢")
@@ -1035,6 +1530,14 @@ class AnomalyClassifier:
             indicators.append("單一目的地（疑似控制服務器）")
             indicators.append("中等流量模式")
 
+            # ✅ Phase 2: 端口類型信息
+            dst_registered_ratio = features.get('dst_registered_ratio', 0)
+            dst_ephemeral_ratio = features.get('dst_ephemeral_ratio', 0)
+            if dst_registered_ratio > 0.5:
+                indicators.append(f"使用註冊端口 {dst_registered_ratio*100:.1f}%（典型 C&C 通訊模式）")
+            elif dst_ephemeral_ratio > 0.5:
+                indicators.append(f"使用臨時端口 {dst_ephemeral_ratio*100:.1f}%（動態端口通訊）")
+
         elif class_name == 'NORMAL_HIGH_TRAFFIC':
             total_bytes = features.get('total_bytes', 0)
             indicators.append(f"大流量: {total_bytes/1e9:.2f} GB")
@@ -1045,6 +1548,25 @@ class AnomalyClassifier:
 
             if features.get('is_likely_server_response', 0) == 1:
                 indicators.append("可能是服務器回應流量")
+
+            # ✅ Phase 1: Server 角色識別
+            server_types = []
+            if features.get('is_likely_web_server', 0) == 1:
+                server_types.append('Web Server')
+            if features.get('is_likely_dns_server', 0) == 1:
+                server_types.append('DNS Server')
+            if features.get('is_likely_db_server', 0) == 1:
+                server_types.append('Database Server')
+            if features.get('is_likely_mail_server', 0) == 1:
+                server_types.append('Mail Server')
+
+            if server_types:
+                indicators.append(f"識別為: {', '.join(server_types)}")
+
+            # ✅ Phase 2: 端口類型信息（服務器回應模式）
+            dst_ephemeral_ratio = features.get('dst_ephemeral_ratio', 0)
+            if dst_ephemeral_ratio > 0.8:
+                indicators.append(f"回應到臨時端口 {dst_ephemeral_ratio*100:.1f}%（典型服務器回應模式）")
 
         elif class_name == 'SCAN_RESPONSE':
             unique_srcs = features.get('unique_srcs', 0)
@@ -1095,6 +1617,49 @@ class AnomalyClassifier:
             indicators.append(f"{unique_srcs:,} 個內部 IP 訪問此服務")
             indicators.append(f"平均封包 {avg_bytes:.0f} bytes（正常服務流量）")
 
+        elif class_name == 'NORMAL_DST_TRAFFIC':
+            unique_srcs = features.get('unique_srcs', 0)
+            flow_count = features.get('flow_count', 0)
+            avg_bytes = features.get('avg_bytes', 0)
+            unique_dst_ports = features.get('unique_dst_ports', 0)
+            dst_ip = context.get('dst_ip', '')
+
+            indicators.append(f"僅 {unique_srcs} 個來源 IP（正常點對點通訊）")
+            indicators.append(f"連線數 {flow_count}（適中）")
+            indicators.append(f"平均封包 {avg_bytes:.0f} bytes（正常大小）")
+            if unique_dst_ports > 1:
+                indicators.append(f"使用 {unique_dst_ports} 個服務埠")
+            if self._is_internal_ip(dst_ip):
+                indicators.append("內部 IP 之間的正常通訊")
+
+        elif class_name == 'SERVER_RESPONSE_TRAFFIC':
+            unique_dst_ports = features.get('unique_dst_ports', 0)
+            unique_srcs = features.get('unique_srcs', 0)
+            flow_count = features.get('flow_count', 0)
+            dst_ip = context.get('dst_ip', '')
+
+            # 從 context 取得 SRC 視角資料
+            src_perspective = context.get('src_perspective', {})
+            src_top_dst_ports = src_perspective.get('top_dst_ports', {})
+            if isinstance(src_top_dst_ports, str):
+                try:
+                    src_top_dst_ports = json.loads(src_top_dst_ports)
+                except:
+                    src_top_dst_ports = {}
+
+            # 找出主要服務埠
+            if src_top_dst_ports:
+                sorted_ports = sorted(src_top_dst_ports.items(), key=lambda x: x[1], reverse=True)
+                top_ports = [p[0] for p in sorted_ports[:3]]
+                indicators.append(f"SRC 視角主要連到埠: {', '.join(map(str, top_ports))}")
+
+            indicators.append(f"DST 視角顯示 {unique_dst_ports} 個不同埠（客戶端臨時埠）")
+            indicators.append(f"來源 IP 數: {unique_srcs}，連線數: {flow_count}")
+            indicators.append("跨視角分析確認：這是伺服器回應到客戶端的正常流量")
+
+            if self._is_internal_ip(dst_ip):
+                indicators.append(f"內部伺服器: {dst_ip}")
+
         return indicators
 
     def get_severity_emoji(self, severity: str) -> str:
@@ -1125,7 +1690,7 @@ class AnomalyClassifier:
                 - bytes_per_src: 每個來源的平均流量
             context: 上下文信息
                 - dst_ip: 目標 IP
-                - timestamp: 時間戳
+                - timestamp / time_bucket: 時間戳
 
         Returns:
             分類結果字典
@@ -1134,6 +1699,84 @@ class AnomalyClassifier:
             context = {}
 
         dst_ip = context.get('dst_ip', 'unknown')
+        time_bucket = context.get('time_bucket') or context.get('timestamp')
+
+        # 定期輸出快取統計
+        self._maybe_log_cache_stats()
+
+        # ========== 跨視角查詢：排除伺服器回應流量誤判 ==========
+        # 當 DST 視角顯示大量不同埠時，可能是：
+        # 1. 被掃描（真正的威脅）
+        # 2. 伺服器回應到客戶端的臨時埠（正常流量）
+        # 透過查詢 SRC 視角來區分這兩種情況
+        unique_dst_ports = features.get('unique_dst_ports', 0)
+        unique_srcs = features.get('unique_srcs', 0)
+        flow_count = features.get('flow_count', 0)
+
+        if unique_dst_ports > 20 and dst_ip != 'unknown' and time_bucket:
+            # ===== 先檢查快取 =====
+            cached_result = self._check_src_cache(dst_ip, time_bucket)
+
+            if cached_result:
+                # 快取命中
+                cache_result_type = cached_result['result']
+                post_process_logger.info(
+                    f"[CACHE_HIT] dst_ip={dst_ip}, result={cache_result_type}, "
+                    f"unique_dst_ports={unique_dst_ports}"
+                )
+
+                if cache_result_type == 'SERVER_RESPONSE':
+                    # 從快取中取得 src_features
+                    context['src_perspective'] = cached_result.get('src_features', {})
+                    return self._create_classification('SERVER_RESPONSE_TRAFFIC', 0.90, features, context)
+                # 如果是 'NOT_SERVER' 或 'NO_DATA'，繼續後續分類邏輯
+
+            else:
+                # 快取未命中，執行實際查詢
+                post_process_logger.info(
+                    f"[SRC_CHECK_TRIGGERED] dst_ip={dst_ip}, unique_dst_ports={unique_dst_ports}, "
+                    f"unique_srcs={unique_srcs}, flow_count={flow_count}, time_bucket={time_bucket}"
+                )
+
+                src_features = self._fetch_src_perspective(dst_ip, time_bucket)
+
+                if src_features:
+                    # 記錄找到 SRC 視角資料
+                    src_unique_dsts = src_features.get('unique_dsts', 0)
+                    src_flow_count = src_features.get('flow_count', 0)
+                    src_top_dst_ports = src_features.get('top_dst_ports', {})
+                    post_process_logger.info(
+                        f"[SRC_DATA_FOUND] dst_ip={dst_ip}, src_unique_dsts={src_unique_dsts}, "
+                        f"src_flow_count={src_flow_count}, src_top_dst_ports={src_top_dst_ports}"
+                    )
+
+                    # 檢查是否為伺服器回應流量
+                    if self._is_server_response_traffic(features, src_features):
+                        # 更新快取
+                        self._update_src_cache(dst_ip, time_bucket, 'SERVER_RESPONSE', src_features)
+
+                        # 補充 context 供生成 indicators 使用
+                        context['src_perspective'] = src_features
+                        post_process_logger.info(
+                            f"[FALSE_POSITIVE_EXCLUDED] dst_ip={dst_ip}, reason=SERVER_RESPONSE_TRAFFIC, "
+                            f"dst_unique_ports={unique_dst_ports}, src_unique_dsts={src_unique_dsts}"
+                        )
+                        return self._create_classification('SERVER_RESPONSE_TRAFFIC', 0.90, features, context)
+                    else:
+                        # 更新快取（非伺服器回應）
+                        self._update_src_cache(dst_ip, time_bucket, 'NOT_SERVER', src_features)
+                        post_process_logger.info(
+                            f"[SRC_CHECK_NOT_EXCLUDED] dst_ip={dst_ip}, reason=NOT_SERVER_RESPONSE, "
+                            f"will_continue_to_classify"
+                        )
+                else:
+                    # 更新快取（無資料）
+                    self._update_src_cache(dst_ip, time_bucket, 'NO_DATA')
+                    post_process_logger.info(
+                        f"[SRC_DATA_NOT_FOUND] dst_ip={dst_ip}, no_src_perspective_data"
+                    )
+
+        # ========== 原有分類邏輯 ==========
 
         # 1. 掃描回應流量（優先判斷，避免誤判為 DDoS）
         if self._is_scan_response(features, context):
@@ -1159,7 +1802,11 @@ class AnomalyClassifier:
         if self._is_popular_server(features, context):
             return self._create_classification('POPULAR_SERVER', 0.70, features, context)
 
-        # 7. 未知 dst 異常
+        # 7. 正常 DST 流量（少量來源的點對點通訊）
+        if self._is_normal_dst_traffic(features, context):
+            return self._create_classification('NORMAL_DST_TRAFFIC', 0.85, features, context)
+
+        # 8. 未知 dst 異常
         return self._create_classification('UNKNOWN', 0.50, features, context)
 
     def _is_scan_response(self, features: Dict, context: Dict) -> bool:
@@ -1324,5 +1971,51 @@ class AnomalyClassifier:
         return (
             unique_srcs > threshold_srcs and
             threshold_bytes_min < avg_bytes < threshold_bytes_max and
+            self._is_internal_ip(dst_ip)
+        )
+
+    def _is_normal_dst_traffic(self, features: Dict, context: Dict) -> bool:
+        """
+        【新增】判斷是否為正常的 DST 流量（少量來源的點對點通訊）
+
+        這個類型用來減少誤報，識別以下情況：
+        - 只有 1-3 個來源 IP 連到這個目的地
+        - 封包大小正常（不是 DDoS 小封包，也不是超大異常封包）
+        - 連線數適中（不是掃描，也不是攻擊）
+        - 內部 IP 之間的正常通訊
+
+        典型案例：
+        - SSH/RDP 遠端連線
+        - 應用程式服務
+        - 資料庫連線
+        - 檔案共享
+        """
+        unique_srcs = features.get('unique_srcs', 0)
+        avg_bytes = features.get('avg_bytes', 0)
+        flow_count = features.get('flow_count', 0)
+        unique_dst_ports = features.get('unique_dst_ports', 0)
+        dst_ip = context.get('dst_ip', '')
+
+        # 從配置讀取閾值（如果有的話）
+        config = self.dst_thresholds.get('NORMAL_DST_TRAFFIC', {})
+        thresholds = config.get('thresholds', {})
+
+        threshold_srcs_max = thresholds.get('unique_srcs_max', 3)
+        threshold_bytes_min = thresholds.get('avg_bytes_min', 500)
+        threshold_bytes_max = thresholds.get('avg_bytes_max', 100000)
+        threshold_flows_max = thresholds.get('flow_count_max', 100)
+        threshold_ports_max = thresholds.get('unique_dst_ports_max', 10)
+
+        # 正常 DST 流量特徵：
+        # 1. 少量來源（1-3 個）- 不是 DDoS 或分散式攻擊
+        # 2. 正常封包大小（500 bytes - 100 KB）- 排除掃描小封包和異常大封包
+        # 3. 適中連線數（< 100）- 不是攻擊或掃描
+        # 4. 少量服務埠（< 10）- 正常服務使用模式
+        # 5. 內部 IP - 內網正常通訊
+        return (
+            1 <= unique_srcs <= threshold_srcs_max and
+            threshold_bytes_min < avg_bytes < threshold_bytes_max and
+            flow_count < threshold_flows_max and
+            unique_dst_ports < threshold_ports_max and
             self._is_internal_ip(dst_ip)
         )

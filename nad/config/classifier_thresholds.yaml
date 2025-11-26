@@ -122,3 +122,12 @@ dst_threats:
 global:
   # 備份時間（凌晨幾點，用於判斷正常高流量）
   backup_hours: [1, 2, 3, 4, 5]
+
+# SRC 視角檢查快取設定
+src_check_cache:
+  # 最多快取的 IP 數量
+  max_size: 500
+  # 快取有效期（秒）- 20 分鐘
+  ttl_seconds: 1200
+  # 統計 log 輸出間隔（秒）- 5 分鐘
+  stats_log_interval: 300
